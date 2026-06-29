@@ -1,6 +1,5 @@
 /**
  * proxy_server.js
-<<<<<<< HEAD
  * Tellus Elevation & OSM Proxy — Node.js
  *
  * Matches TerrainTilesElevationSource.java Terrarium decode exactly:
@@ -11,33 +10,6 @@
  * GET  /tile?z=&x=&y= → full 256×256 tile as { z, x, y, width, height, elevations[] }
  * POST /elevation     → batch pixel samples { tiles: [{z,x,y,pixels:[[px,py],...]}] }
  * POST /osm           → fetches OpenStreetMap building and road vectors
-=======
- * Tellus Elevation Proxy — Node.js
- *
- * Roblox cannot decode PNG pixel data natively.
- * This proxy fetches AWS Terrain Tiles (Terrarium format PNG),
- * decodes them with sharp, and returns a flat JSON elevation array.
- *
- * Matches TerrainTilesElevationSource.java Terrarium decode exactly:
- *   elevation = (R * 256 + G + B / 256) - 32768
- *
- * Zoom range: 0–15 (Tellus uses 6, 8, 10, 11, 12 depending on worldScale)
- * Tile URL: https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png
- *
- * ENDPOINTS:
- *   GET  /              → health check
- *   GET  /tile?z=&x=&y= → full 256×256 tile as { z, x, y, width, height, elevations[] }
- *   POST /elevation     → batch pixel samples { tiles: [{z,x,y,pixels:[[px,py],...]}] }
- *                         returns { elevations: [float,...] }
- *
- * DEPLOY:
- *   Railway:  connect GitHub repo → auto-deploys, gives HTTPS URL
- *   Render:   New Web Service → Node → npm start
- *   Replit:   paste, run, copy URL
- *
- *   npm install express axios sharp cors
- *   node proxy_server.js
->>>>>>> c84c3e255f1e19e1542d019e8ef2362d2ebfd4f0
  */
 
 const express = require("express");
@@ -57,10 +29,6 @@ function terrariumToMeters(r, g, b) {
 }
 
 // ── Tile cache (in-memory, LRU-style by count) ────────────────────────────────
-<<<<<<< HEAD
-=======
-// Tellus has a disk cache (TerrainTilesDiskCache); we use memory here.
->>>>>>> c84c3e255f1e19e1542d019e8ef2362d2ebfd4f0
 const tileCache = new Map();
 const CACHE_MAX = 200;  // max tiles kept in memory
 
@@ -117,10 +85,6 @@ async function fetchTile(z, x, y) {
 }
 
 // ── Bilinear interpolation ─────────────────────────────────────────────────────
-<<<<<<< HEAD
-=======
-// Matches TellusElevationSource.sampleBilinearLocal
->>>>>>> c84c3e255f1e19e1542d019e8ef2362d2ebfd4f0
 function sampleBilinear(tile, px, py) {
     const { width, height, elevations } = tile;
     const x0 = Math.floor(px);
@@ -141,10 +105,6 @@ function sampleBilinear(tile, px, py) {
 }
 
 // ── GET /tile?z=&x=&y= ───────────────────────────────────────────────────────
-<<<<<<< HEAD
-=======
-// Returns the full decoded tile — ElevationSource.lua caches this per tile
->>>>>>> c84c3e255f1e19e1542d019e8ef2362d2ebfd4f0
 app.get("/tile", async (req, res) => {
     const z = parseInt(req.query.z);
     const x = parseInt(req.query.x);
@@ -159,10 +119,6 @@ app.get("/tile", async (req, res) => {
 
     try {
         const tile = await fetchTile(z, x, y);
-<<<<<<< HEAD
-=======
-        // Convert Float32Array to regular array for JSON serialisation
->>>>>>> c84c3e255f1e19e1542d019e8ef2362d2ebfd4f0
         res.json({
             z, x, y,
             width:      tile.width,
@@ -176,12 +132,6 @@ app.get("/tile", async (req, res) => {
 });
 
 // ── POST /elevation ───────────────────────────────────────────────────────────
-<<<<<<< HEAD
-=======
-// Batch pixel sampling — used by ElevationSource.batchSampleElevations
-// Body: { tiles: [ { z, x, y, pixels: [[px,py], ...] } ] }
-// Returns: { elevations: [float, ...] }  (same order as pixels across all tiles)
->>>>>>> c84c3e255f1e19e1542d019e8ef2362d2ebfd4f0
 app.post("/elevation", async (req, res) => {
     const { tiles } = req.body;
 
@@ -217,8 +167,7 @@ app.post("/elevation", async (req, res) => {
     res.json({ elevations: results });
 });
 
-<<<<<<< HEAD
-// ── POST /osm (NEW: Fetches Buildings & Roads) ────────────────────────────────
+// ── POST /osm (Fetches Buildings & Roads) ────────────────────────────────────
 app.post("/osm", async (req, res) => {
     const { minLat, minLon, maxLat, maxLon } = req.body;
     
@@ -261,33 +210,20 @@ app.post("/osm", async (req, res) => {
     }
 });
 
-=======
->>>>>>> c84c3e255f1e19e1542d019e8ef2362d2ebfd4f0
 // ── GET / — health check ──────────────────────────────────────────────────────
 app.get("/", (_req, res) => {
     res.json({
         status:  "Tellus Elevation Proxy running",
-<<<<<<< HEAD
         version: "2.1.0",
-=======
-        version: "2.0.0",
->>>>>>> c84c3e255f1e19e1542d019e8ef2362d2ebfd4f0
         cache:   `${tileCache.size}/${CACHE_MAX} tiles`,
         endpoints: [
             "GET  /tile?z=&x=&y=  → full decoded tile",
             "POST /elevation       → batch pixel samples",
-<<<<<<< HEAD
             "POST /osm             → fetch buildings and roads"
-=======
->>>>>>> c84c3e255f1e19e1542d019e8ef2362d2ebfd4f0
         ]
     });
 });
 
 app.listen(PORT, () => {
     console.log(`[Tellus Proxy] Listening on port ${PORT}`);
-<<<<<<< HEAD
 });
-=======
-});
->>>>>>> c84c3e255f1e19e1542d019e8ef2362d2ebfd4f0
