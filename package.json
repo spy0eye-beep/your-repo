@@ -1,0 +1,15 @@
+{
+  "name": "tellus-elevation-proxy",
+  "version": "2.0.0",
+  "description": "Elevation tile proxy for Tellus Roblox port",
+  "main": "proxy_server.js",
+  "scripts": {
+    "start": "node proxy_server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "axios": "^1.6.0",
+    "sharp": "^0.33.0",
+    "cors": "^2.8.5"
+  }
+}
