@@ -209,7 +209,30 @@ app.post("/osm", async (req, res) => {
         res.status(500).json({ error: "Failed to fetch OSM data" });
     }
 });
+// ── GET /geocode (Bypasses Roblox User-Agent restriction) ─────────────
+app.get("/geocode", async (req, res) => {
+    const q = req.query.q;
+    const limit = req.query.limit || 5;
+    if (!q) return res.status(400).json({ error: "Missing query 'q'" });
 
+    try {
+        const url = `https://nominatim.openstreetmap.org/search?format=json&limit=${limit}&q=${encodeURIComponent(q)}`;
+        const response = await axios.get(url, {
+            headers: { "User-Agent": "Tellus-Roblox-Proxy/1.0" } // Applied safely in Node!
+        });
+        res.json(response.data);
+    } catch (err) {
+        console.error("[Proxy] /geocode failed:", err.message);
+        res.status(500).json({ error: "Geocode fetch failed" });
+    }
+});
+
+// ── POST /landcover (Dummy endpoint to stop 404 spam) ─────────────────
+app.post("/landcover", (req, res) => {
+    // Returns an empty array. TerrainService will see this and 
+    // gracefully fall back to its latitude-based biome math.
+    res.json({ classes: [] });
+});
 // ── GET / — health check ──────────────────────────────────────────────────────
 app.get("/", (_req, res) => {
     res.json({
