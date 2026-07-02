@@ -9,7 +9,7 @@
  * GET  /              → health check
  * GET  /tile?z=&x=&y= → full 256×256 tile as { z, x, y, width, height, elevations[] }
  * POST /elevation     → batch pixel samples { tiles: [{z,x,y,pixels:[[px,py],...]}] }
- * POST /osm           → fetches OpenStreetMap building and road vectors
+ * POST /osm           → fetches OpenStreetMap building and road vectors (FIXED FOR GEOMETRY)
  */
 
 const express = require("express");
@@ -21,7 +21,7 @@ const app  = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(cors());
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({ limit: "2mb" })); // Slightly increased limit for larger geometry arrays
 
 // ── Terrarium decode (matches TerrainTilesElevationSource.java) ───────────────
 function terrariumToMeters(r, g, b) {
@@ -167,7 +167,7 @@ app.post("/elevation", async (req, res) => {
     res.json({ elevations: results });
 });
 
-// ── POST /osm (Fetches Buildings & Roads) ────────────────────────────────────
+// ── POST /osm (FIXED: Fetches full geometry array instead of center points) ──
 app.post("/osm", async (req, res) => {
     const { minLat, minLon, maxLat, maxLon } = req.body;
     
@@ -175,13 +175,14 @@ app.post("/osm", async (req, res) => {
         return res.status(400).json({ error: "Missing bounding box" });
     }
 
+    // CHANGED: "out center;" replaced with "out geom;" to get full path sequences
     const query = `
         [out:json][timeout:25];
         (
           way["building"](${minLat},${minLon},${maxLat},${maxLon});
           way["highway"](${minLat},${minLon},${maxLat},${maxLon});
         );
-        out center;
+        out geom;
     `;
 
     try {
@@ -193,22 +194,31 @@ app.post("/osm", async (req, res) => {
         const buildings = [];
         const roads = [];
 
+        // CHANGED: Iterating through geometry arrays instead of single center points
         elements.forEach(el => {
-            if (el.tags && el.center) {
+            if (el.type === "way" && el.geometry) {
                 if (el.tags.building) {
-                    buildings.push({ lat: el.center.lat, lon: el.center.lon, name: el.tags.name || "Building" });
+                    buildings.push({
+                        nodes: el.geometry.map(g => ({ lat: g.lat, lon: g.lon })),
+                        name: el.tags.name || "Building"
+                    });
                 } else if (el.tags.highway) {
-                    roads.push({ lat: el.center.lat, lon: el.center.lon, type: el.tags.highway });
+                    roads.push({
+                        nodes: el.geometry.map(g => ({ lat: g.lat, lon: g.lon })),
+                        type: el.tags.highway
+                    });
                 }
             }
         });
 
-        res.json({ buildings, roads });
+        // Returning ways: roads to exactly match OsmGenerator.lua expectation
+        res.json({ buildings, ways: roads });
     } catch (error) {
         console.error("[Proxy] /osm Fetch Error:", error.message);
         res.status(500).json({ error: "Failed to fetch OSM data" });
     }
 });
+
 // ── GET /geocode (Bypasses Roblox User-Agent restriction) ─────────────
 app.get("/geocode", async (req, res) => {
     const q = req.query.q;
@@ -233,6 +243,7 @@ app.post("/landcover", (req, res) => {
     // gracefully fall back to its latitude-based biome math.
     res.json({ classes: [] });
 });
+
 // ── GET / — health check ──────────────────────────────────────────────────────
 app.get("/", (_req, res) => {
     res.json({
