@@ -444,6 +444,77 @@ app.post("/roads", async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Nominatim geocode queue + cache
+//
+// Nominatim's usage policy caps requests at ~1/sec and will 429 aggressively
+// past that. /geocode previously called it directly with zero throttling,
+// so any burst of searches (multiple players, or one player typing quickly)
+// blew straight through the limit. This mirrors the Overpass queue pattern:
+// one request in flight at a time, minimum gap enforced, results cached by
+// the exact query string so repeat searches never hit Nominatim again.
+// ─────────────────────────────────────────────────────────────────────────────
+const MIN_NOMINATIM_GAP_MS = 1100; // ~1 req/sec, matches Nominatim's usage policy
+const NOMINATIM_TIMEOUT_MS = 10000;
+
+const geocodeCache = new Map();
+const GEOCODE_CACHE_MAX = 300;
+
+function geocodeCacheSet(key, value) {
+    if (geocodeCache.size >= GEOCODE_CACHE_MAX) {
+        geocodeCache.delete(geocodeCache.keys().next().value);
+    }
+    geocodeCache.set(key, value);
+}
+
+const nominatimQueue = [];
+let   nominatimBusy   = false;
+let   lastNominatimAt = 0;
+
+async function _runNextNominatim() {
+    if (nominatimBusy || nominatimQueue.length === 0) return;
+    nominatimBusy = true;
+
+    const { q, limit, resolve, reject } = nominatimQueue.shift();
+
+    const gap = Date.now() - lastNominatimAt;
+    if (gap < MIN_NOMINATIM_GAP_MS) {
+        await new Promise(r => setTimeout(r, MIN_NOMINATIM_GAP_MS - gap));
+    }
+
+    try {
+        const url = `https://nominatim.openstreetmap.org/search?format=json&limit=${limit}&q=${encodeURIComponent(q)}`;
+        const response = await axios.get(url, {
+            headers: { "User-Agent": "Tellus-Roblox-Proxy/3.0" },
+            timeout: NOMINATIM_TIMEOUT_MS,
+        });
+        lastNominatimAt = Date.now();
+        nominatimBusy = false;
+        setImmediate(_runNextNominatim);
+        resolve(response.data);
+    } catch (err) {
+        lastNominatimAt = Date.now();
+        nominatimBusy = false;
+        setImmediate(_runNextNominatim);
+        reject(err);
+    }
+}
+
+function postGeocode(q, limit) {
+    const key = `${limit}|${q.toLowerCase().trim()}`;
+    if (geocodeCache.has(key)) {
+        return Promise.resolve(geocodeCache.get(key));
+    }
+    return new Promise((resolve, reject) => {
+        nominatimQueue.push({
+            q, limit,
+            resolve: (data) => { geocodeCacheSet(key, data); resolve(data); },
+            reject,
+        });
+        _runNextNominatim();
+    });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // GET /geocode
 // ─────────────────────────────────────────────────────────────────────────────
 app.get("/geocode", async (req, res) => {
@@ -451,12 +522,16 @@ app.get("/geocode", async (req, res) => {
     if (!q) return res.status(400).json({ error: "Missing query 'q'" });
 
     try {
-        const url = `https://nominatim.openstreetmap.org/search?format=json&limit=${limit}&q=${encodeURIComponent(q)}`;
-        const response = await axios.get(url, { headers: { "User-Agent": "Tellus-Roblox-Proxy/3.0" } });
-        res.json(response.data);
+        const data = await postGeocode(q, limit);
+        res.json(data);
     } catch (err) {
         console.error("[Proxy] /geocode failed:", err.message);
-        res.status(500).json({ error: "Geocode fetch failed" });
+        const status = err.response?.status;
+        if (status === 429) {
+            res.status(429).json({ error: "Geocode rate limited, try again shortly" });
+        } else {
+            res.status(500).json({ error: "Geocode fetch failed" });
+        }
     }
 });
 
