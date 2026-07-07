@@ -1,5 +1,5 @@
 /**
- * proxy_server.js  —  Tellus Elevation & OSM Proxy  (v3.2.0)
+ * proxy_server.js  —  Tellus Elevation & OSM Proxy  (v3.0.0)
  * Node.js / Express, deploy on Railway.
  *
  * What changed in v3 vs v2:
@@ -115,7 +115,6 @@ const OVERPASS_RETRY_DELAY  = 5000; // ms before each retry
 //   https://overpass.private.coffee/api/interpreter
 const OVERPASS_URL = process.env.OVERPASS_URL
     || "https://overpass-api.de/api/interpreter";
-const LANDCOVER_URL = process.env.LANDCOVER_URL || "";
 
 const overpassQueue = [];
 let   overpassBusy  = false;
@@ -472,68 +471,10 @@ app.get("/geocode", async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// POST /landcover
-//
-// If LANDCOVER_URL is configured, this forwards { points } to that service.
-// Expected response: { classes: [{ esa: number, koppen: string }, ...] }.
-// Without a provider, return a deterministic ESA/Koppen-style approximation
-// so Roblox keeps using the real landcover path instead of disabling it.
+// POST /landcover  — stub (TerrainService falls back gracefully on empty array)
 // ─────────────────────────────────────────────────────────────────────────────
-function approximateLandcover(lat, lon) {
-    const a = Math.abs(lat);
-    const n = Math.sin((lat * 12.9898 + lon * 78.233) * Math.PI / 180) * 43758.5453;
-    const noise = n - Math.floor(n);
-
-    let esa = 30;      // grassland
-    let koppen = "Cfb";
-
-    if (a >= 72) {
-        esa = 70; koppen = "EF";       // permanent snow/ice
-    } else if (a >= 62) {
-        esa = noise > 0.35 ? 20 : 60; koppen = "ET";
-    } else if (a >= 48) {
-        esa = noise > 0.55 ? 10 : 30; koppen = "Dfb";
-    } else if (a >= 35) {
-        esa = noise > 0.4 ? 10 : 40; koppen = lat > 0 ? "Cfb" : "Cfa";
-    } else if (a >= 17 && a <= 34 && noise > 0.18) {
-        esa = noise > 0.65 ? 60 : 20; koppen = noise > 0.65 ? "BWh" : "BSh";
-    } else if (a < 12) {
-        esa = noise > 0.22 ? 10 : 90; koppen = noise > 0.22 ? "Af" : "Am";
-    } else {
-        esa = noise > 0.45 ? 10 : 30; koppen = "Aw";
-    }
-
-    return { esa, koppen };
-}
-
-app.post("/landcover", async (req, res) => {
-    const points = req.body?.points;
-    if (!Array.isArray(points)) {
-        return res.status(400).json({ error: "Body must have 'points' array" });
-    }
-
-    if (LANDCOVER_URL) {
-        try {
-            const response = await axios.post(
-                LANDCOVER_URL,
-                { points },
-                { timeout: 20000, headers: { "User-Agent": "Tellus-Roblox-Proxy/3.2" } }
-            );
-            const classes = Array.isArray(response.data?.classes) ? response.data.classes : [];
-            if (classes.length === points.length) {
-                return res.json({ classes });
-            }
-            console.warn("[Proxy] LANDCOVER_URL returned unexpected shape; using approximation");
-        } catch (err) {
-            console.warn("[Proxy] LANDCOVER_URL failed; using approximation:", err.message);
-        }
-    }
-
-    const classes = points.map(pt => approximateLandcover(
-        Math.max(-85.05112878, Math.min(85.05112878, Number(pt.lat) || 0)),
-        Math.max(-180, Math.min(180, Number(pt.lon) || 0))
-    ));
-    res.json({ classes });
+app.post("/landcover", (_req, res) => {
+    res.json({ classes: [] });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -542,7 +483,7 @@ app.post("/landcover", async (req, res) => {
 app.get("/", (_req, res) => {
     res.json({
         status:  "Tellus Elevation Proxy running",
-        version: "3.2.0",
+        version: "3.0.0",
         cache: {
             tiles: `${tileCache.size}/${TILE_CACHE_MAX}`,
             osm:   `${osmCache.size}/${OSM_CACHE_MAX}`,
@@ -560,11 +501,11 @@ app.get("/", (_req, res) => {
             "POST /roads             → road ways (cached)",
             "POST /osm               → roads + buildings combined (cached)",
             "GET  /geocode?q=        → Nominatim search",
-            "POST /landcover         → ESA/Koppen classes (provider or approximation)",
+            "POST /landcover         → ESA WorldCover stub",
         ],
     });
 });
 
 app.listen(PORT, () => {
-    console.log(`[Tellus Proxy] v3.2.0 listening on port ${PORT}`);
+    console.log(`[Tellus Proxy] v3.0.0 listening on port ${PORT}`);
 });
