@@ -40,6 +40,9 @@ const express = require("express");
 const axios   = require("axios");
 const sharp   = require("sharp");
 const cors    = require("cors");
+const zlib    = require("zlib");
+const fs      = require("fs");
+const path    = require("path");
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -471,10 +474,105 @@ app.get("/geocode", async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// POST /landcover  — stub (TerrainService falls back gracefully on empty array)
+// Köppen–Geiger climate raster (packed binary, mode-downsampled to 0.0333°)
+//
+// koppen_packed.bin.gz is a gzipped, self-describing grid built from the
+// Tellus mod's koppen_geiger_0p00833333.tif (43200x21600 uint8, values
+// 0..30). We downsampled 4x by DOMINANT non-zero class per block — so a
+// mostly-land cell keeps its real climate even with a sliver of nodata —
+// giving a 10800x5400 grid (~58MB raw, ~0.9MB gzipped, decompressed into
+// memory once on boot). Value 0 = nodata/ocean.
+//
+// Header (little-endian): 4s magic "KPKG", u16 version, u32 width,
+// u32 height, f64 originLon, f64 originLat, f64 degPerPixel, f64 factor.
+// Sampling is plain equirectangular: px=(lon-originLon)/deg,
+// py=(originLat-lat)/deg — no projection math needed.
 // ─────────────────────────────────────────────────────────────────────────────
-app.post("/landcover", (_req, res) => {
-    res.json({ classes: [] });
+const KOPPEN_CODES = [
+    null, "Af","Am","Aw","BWh","BWk","BSh","BSk","Csa","Csb","Csc",
+    "Cwa","Cwb","Cwc","Cfa","Cfb","Cfc","Dsa","Dsb","Dsc","Dsd",
+    "Dwa","Dwb","Dwc","Dwd","Dfa","Dfb","Dfc","Dfd","ET","EF",
+];
+
+let koppen = null; // { grid:Buffer, width, height, originLon, originLat, deg }
+
+function loadKoppen() {
+    try {
+        const gzPath = path.join(__dirname, "koppen_packed.bin.gz");
+        const raw = zlib.gunzipSync(fs.readFileSync(gzPath));
+        const magic = raw.toString("latin1", 0, 4);
+        if (magic !== "KPKG") throw new Error("bad magic: " + magic);
+        const width     = raw.readUInt32LE(6);
+        const height    = raw.readUInt32LE(10);
+        const originLon = raw.readDoubleLE(14);
+        const originLat = raw.readDoubleLE(22);
+        const deg       = raw.readDoubleLE(30);
+        const HEADER    = 46;
+        const grid = raw.subarray(HEADER, HEADER + width * height);
+        koppen = { grid, width, height, originLon, originLat, deg };
+        console.log(`[Tellus Proxy] Köppen raster loaded: ${width}x${height} @ ${deg.toFixed(4)}°/px`);
+    } catch (err) {
+        console.warn("[Tellus Proxy] Köppen raster unavailable — /landcover will return null koppen:", err.message);
+        koppen = null;
+    }
+}
+loadKoppen();
+
+function koppenAt(lat, lon) {
+    if (!koppen) return null;
+    const px = Math.floor((lon - koppen.originLon) / koppen.deg);
+    const py = Math.floor((koppen.originLat - lat) / koppen.deg);
+    if (px < 0 || py < 0 || px >= koppen.width || py >= koppen.height) return null;
+    const v = koppen.grid[py * koppen.width + px];
+    return (v > 0 && v < KOPPEN_CODES.length) ? KOPPEN_CODES[v] : null;
+}
+
+// Nearest non-nodata sample: coastal points can land on an ocean (0) pixel
+// even though real land is one cell away. Spiral out a few rings so shoreline
+// columns still get a plausible climate instead of null.
+function koppenNearest(lat, lon, maxRing) {
+    const direct = koppenAt(lat, lon);
+    if (direct) return direct;
+    if (!koppen) return null;
+    const d = koppen.deg;
+    for (let ring = 1; ring <= (maxRing || 3); ring++) {
+        for (let dy = -ring; dy <= ring; dy++) {
+            for (let dx = -ring; dx <= ring; dx++) {
+                if (Math.max(Math.abs(dx), Math.abs(dy)) !== ring) continue;
+                const c = koppenAt(lat + dy * d, lon + dx * d);
+                if (c) return c;
+            }
+        }
+    }
+    return null;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /landcover  — real Köppen climate per point (item: biome realism)
+//
+// Body: { points: [{lat, lon}, ...] }
+// Returns: { classes: [{esa, koppen}, ...] } in the SAME order as points.
+//
+// esa: we don't ship an ESA WorldCover raster (10m, terabytes), so esa is
+//   left at 0 ("no data") and the Lua BiomeClassification uses its
+//   esa=NONE fallback rows keyed on Köppen alone — still a massive upgrade
+//   over the old latitude-only guess. Wire a real ESA source here later and
+//   the Lua side needs no changes.
+// koppen: the Köppen–Geiger code string ("Af", "BWh", ...) or null (ocean/
+//   nodata) — the Lua side treats null as "use latitude fallback".
+// ─────────────────────────────────────────────────────────────────────────────
+app.post("/landcover", (req, res) => {
+    const points = (req.body && req.body.points) || [];
+    if (!Array.isArray(points) || points.length === 0) {
+        return res.json({ classes: [] });
+    }
+    const classes = points.map((p) => {
+        const lat = Number(p.lat), lon = Number(p.lon);
+        if (!isFinite(lat) || !isFinite(lon)) return { esa: 0, koppen: "NONE" };
+        const code = koppenNearest(lat, lon, 3);
+        return { esa: 0, koppen: code || "NONE" };
+    });
+    res.json({ classes });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -483,7 +581,8 @@ app.post("/landcover", (_req, res) => {
 app.get("/", (_req, res) => {
     res.json({
         status:  "Tellus Elevation Proxy running",
-        version: "3.0.0",
+        version: "3.2.0",
+        koppen:  koppen ? `${koppen.width}x${koppen.height} loaded` : "unavailable",
         cache: {
             tiles: `${tileCache.size}/${TILE_CACHE_MAX}`,
             osm:   `${osmCache.size}/${OSM_CACHE_MAX}`,
@@ -501,7 +600,7 @@ app.get("/", (_req, res) => {
             "POST /roads             → road ways (cached)",
             "POST /osm               → roads + buildings combined (cached)",
             "GET  /geocode?q=        → Nominatim search",
-            "POST /landcover         → ESA WorldCover stub",
+            "POST /landcover         → Köppen climate per point",
         ],
     });
 });
