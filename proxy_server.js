@@ -307,7 +307,14 @@ app.post("/elevation", async (req, res) => {
 //
 // WaterMaskService.lua should POST here instead of hitting Overpass directly.
 // The query matches WaterMaskService's fetchCell() query exactly:
-//   natural=water, waterway=riverbank, natural=beach (closed ways only).
+//   natural=water, waterway=riverbank, natural=beach (closed polygon ways),
+//   PLUS waterway=river/stream/canal/drain (open linestrings — rivers,
+//   streams, and waterfalls are almost always tagged this way, not as a
+//   closed riverbank polygon). WaterMaskService.lua buffers these lines by
+//   their tagged/default width into a synthetic polygon client-side, since
+//   Overpass has no server-side buffering. Without this, any narrow water
+//   feature not wrapped in a riverbank polygon (most rivers/streams on
+//   Earth, including every waterfall) was completely invisible in-game.
 // ─────────────────────────────────────────────────────────────────────────────
 app.post("/water", async (req, res) => {
     const bbox = parseBbox(req.body);
@@ -321,7 +328,7 @@ app.post("/water", async (req, res) => {
         return res.json(osmCache.get(cacheKey));
     }
 
-    const query = `[out:json][timeout:25];(way["natural"="water"](${minLat},${minLon},${maxLat},${maxLon});way["waterway"="riverbank"](${minLat},${minLon},${maxLat},${maxLon});way["natural"="beach"](${minLat},${minLon},${maxLat},${maxLon}););out body;>;out skel qt;`;
+    const query = `[out:json][timeout:25];(way["natural"="water"](${minLat},${minLon},${maxLat},${maxLon});way["waterway"="riverbank"](${minLat},${minLon},${maxLat},${maxLon});way["natural"="beach"](${minLat},${minLon},${maxLat},${maxLon});way["waterway"~"^(river|stream|canal|drain)$"](${minLat},${minLon},${maxLat},${maxLon}););out body;>;out skel qt;`;
 
     try {
         const data = await postOverpass(query);
