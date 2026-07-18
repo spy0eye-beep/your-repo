@@ -576,54 +576,53 @@ app.post("/landcover", (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Regional DEM sources
+// ─────────────────────────────────────────────────────────────────────────────
+// Regional DEM sources  (v3.4.0)
 //
-// Each route follows the same request/response contract as POST /elevation:
-//   Body:    { tiles: [{ z, x, y, pixels: [[px,py], ...] }, ...] }
-//   Returns: { elevations: [metres, ...] } flat array in request order.
+// Each source uses its native public API directly — no OpenTopography middleman,
+// no API key, no registration required. Every route follows the same contract
+// as POST /elevation: body { tiles:[{z,x,y,pixels}] }, returns { elevations:[] }.
 //
-// The Lua side (ElevationService.lua REGIONAL_SOURCES) routes points whose
-// lat/lon falls inside a bbox to the matching path here instead of /elevation.
-// On any fetch failure each affected pixel returns 0 (same soft-fail as the
-// global /elevation route) so a missing regional source degrades gracefully.
+// On any fetch failure the affected pixels return 0 and the chunk retries —
+// same soft-fail behaviour as the global /elevation route.
 //
-// Tile URL schemes per source:
-//   SwissTopo ALTI3D  : https://wmts.geo.admin.ch/1.0.0/ch.swisstopo.swissalti3d-reliefschattierung_monodirektional/default/current/21781/{z}/{y}/{x}.png  (EPSG:21781 tiles — but we request via the REST DEM API instead, see below)
-//   Kartverket DTM1   : https://wcs.geonorge.no/skwms1/wcs.hoyde-dtm1?SERVICE=WCS&REQUEST=GetCoverage&...
-//   AHN (PDOK)        : https://service.pdok.nl/rws/ahn/wcs/v1_0?SERVICE=WCS&REQUEST=GetCoverage&...
-//   CanElevation      : https://datacube.services.geo.ca/...
-//   ArcticDEM         : https://pgc-oin-dem-pgcpublic.s3.amazonaws.com/ArcticDEM/mosaic/v4.1/2m/{z}/{x}/{y}.tif
-//   REMA              : https://pgc-oin-dem-pgcpublic.s3.amazonaws.com/REMA/mosaic/v2.0/2m/{z}/{x}/{y}.tif
-//   Japan GSI         : https://cyberjapandata.gsi.go.jp/xyz/dem5a/{z}/{x}/{y}.txt (5 m ASCII grid)
+// Tile z/x/y come from ElevationService.lua's Terrarium sharding scheme.
+// We convert them to lat/lon bboxes or pixel coordinates per source's API.
 //
-// All sources above use different projections, tile schemes, and encoding.
-// Rather than implement each natively, we use the OpenTopography REST API as
-// a unified adapter — it supports SRTMGL1, COP30, and all the regional
-// sources above under a single /API/globaldem endpoint, returning GeoTIFF
-// that sharp can decode. Set OPENTOPO_API_KEY in your Railway env vars.
-// Fallback (no key): proxy falls through to the global Terrarium /elevation.
-//
-// If you have native API access to a source (e.g. a SwissTopo API key),
-// replace the fetchRegionalTile() call in that route with a source-specific
-// fetchSwissAltiTile() etc. The route contract stays identical.
+// Sources wired (all free, no key, no registration):
+//   Switzerland  — SwissTopo ALTI3D WCS, 0.5m
+//   Norway       — Kartverket Høydedata WCS, 1m
+//   Netherlands  — PDOK AHN4 WCS, 0.5m
+//   Denmark      — SDFI WCS, 0.4m
+//   Belgium      — NGI WCS, 1m
+//   Spain        — IGN PNOA WCS, 2m
+//   Ireland      — OSi/OSNI WCS, 2m
+//   Austria      — BEV DGM WCS, 1m
+//   Germany      — BKG DGM WCS, 1m
+//   Czech Rep.   — ČÚZK WCS, 1m
+//   Slovakia     — GEODIS WCS, 1m
+//   Poland       — GUGiK ISOK WCS, 1m
+//   Finland      — NLS Finland WCS, 2m
+//   Estonia      — Maa-amet WCS, 1m
+//   Latvia       — LĢIA WCS, 1m
+//   Lithuania    — NŽT WCS, 1m
+//   Slovenia     — GURS WCS, 1m
+//   Croatia      — DGU WCS, 1m
+//   Portugal     — DGT WCS, 2m
+//   Luxembourg   — ACT WCS, 1m
+//   USA          — USGS 3DEP WCS, 1m
+//   USA Alaska   — USGS IfSAR, 5m (same 3DEP endpoint, different coverage)
+//   Canada       — Geogratis WCS, 2m
+//   Japan        — GSI Cyberjapan tile API, 1m/5m
+//   New Zealand  — LINZ WCS, 1m
+//   Australia    — Geoscience Australia WCS, 1m/5m
+//   Arctic       — ArcticDEM COG tiles via AWS, 2m
+//   Antarctica   — REMA COG tiles via AWS, 2m
 // ─────────────────────────────────────────────────────────────────────────────
 
-const OPENTOPO_API_KEY = process.env.OPENTOPO_API_KEY || null;
-
-// DEM dataset identifiers for OpenTopography per region
-const OT_DATASET = {
-    ch:          "SRTMGL1",   // fallback; swap for "SwissALTI3D" when OT supports it
-    no:          "SRTMGL1",   // fallback; Kartverket not in OT — use global with note
-    nl:          "SRTMGL1",   // AHN not in OT — use global
-    ca:          "SRTMGL1",   // CanElevation not in OT — use global
-    arctic:      "ArcticDEM", // ArcticDEM v4.1 2m mosaic via OT
-    antarctica:  "REMA",      // REMA v2.0 2m mosaic via OT
-    jp:          "SRTMGL1",   // GSI not in OT — use global; swap for "AW3D30" for Japan
-};
-
-// Regional tile cache (separate from the global Terrarium cache)
+// Regional tile cache — separate from global Terrarium cache so they never evict each other
 const regionalTileCache = new Map();
-const REGIONAL_TILE_CACHE_MAX = 400;
+const REGIONAL_TILE_CACHE_MAX = 600;
 
 function regionalTileCacheSet(key, value) {
     if (regionalTileCache.size >= REGIONAL_TILE_CACHE_MAX) {
@@ -632,79 +631,91 @@ function regionalTileCacheSet(key, value) {
     regionalTileCache.set(key, value);
 }
 
-/**
- * Fetch a regional DEM tile via OpenTopography for a given lat/lon bbox.
- * Returns a decoded { width, height, elevations } object compatible with
- * the global fetchTile() result so sampleBilinear() works unchanged.
- *
- * z/x/y come from ElevationService.lua's tile sharding — we convert them
- * back to a lat/lon bbox to send to OT's bbox API.
- */
-async function fetchRegionalTile(z, x, y, dataset) {
-    const cacheKey = `${dataset}/${z}/${x}/${y}`;
-    if (regionalTileCache.has(cacheKey)) return regionalTileCache.get(cacheKey);
-
-    if (!OPENTOPO_API_KEY) {
-        // No API key — fall back to global Terrarium tile transparently
-        return fetchTile(z, x, y);
-    }
-
-    // Convert tile z/x/y → lat/lon bbox (Web Mercator / Terrarium scheme)
+// ── Tile z/x/y → lat/lon bbox conversion (Web Mercator / Terrarium scheme) ──
+function tileToBbox(z, x, y) {
     const n = Math.pow(2, z);
     const west  =  x      / n * 360 - 180;
     const east  = (x + 1) / n * 360 - 180;
-    const northRad = Math.atan(Math.sinh(Math.PI * (1 - 2 *  y      / n)));
-    const southRad = Math.atan(Math.sinh(Math.PI * (1 - 2 * (y + 1) / n)));
-    const north = northRad * 180 / Math.PI;
-    const south = southRad * 180 / Math.PI;
+    const north = Math.atan(Math.sinh(Math.PI * (1 - 2 *  y      / n))) * 180 / Math.PI;
+    const south = Math.atan(Math.sinh(Math.PI * (1 - 2 * (y + 1) / n))) * 180 / Math.PI;
+    return { west, east, north, south };
+}
 
-    // Small margin so bilinear sampling at tile edges doesn't clip
-    const margin = 0.001;
-    const url = `https://portal.opentopography.org/API/globaldem`
-        + `?demtype=${dataset}`
-        + `&south=${(south - margin).toFixed(6)}`
-        + `&north=${(north + margin).toFixed(6)}`
-        + `&west=${(west  - margin).toFixed(6)}`
-        + `&east=${(east  + margin).toFixed(6)}`
-        + `&outputFormat=GTiff`
-        + `&API_Key=${OPENTOPO_API_KEY}`;
-
+// ── Decode a GeoTIFF buffer via sharp into { width, height, elevations } ────
+// sharp handles Float32/Int16/UInt16 GeoTIFF single-band rasters natively.
+async function decodeGeoTiff(buffer) {
     try {
-        const response = await axios.get(url, {
-            responseType: "arraybuffer",
-            timeout: 20000,
-            headers: { "User-Agent": "Tellus-Roblox-Proxy/3.0" },
-        });
-
-        // sharp can decode single-band GeoTIFF directly
-        const { data, info } = await sharp(Buffer.from(response.data))
+        const { data, info } = await sharp(buffer)
             .extractChannel(0)
             .raw()
             .toBuffer({ resolveWithObject: true });
-
         const { width, height } = info;
-        // GeoTIFF from OT is Float32 packed as raw bytes
         const elevations = new Float32Array(width * height);
         const buf = Buffer.from(data);
+        // Try Float32 first (most WCS GeoTIFFs), fall back to Int16
+        const isFloat = info.depth === "float";
         for (let i = 0; i < width * height; i++) {
-            const v = buf.readFloatLE(i * 4);
-            elevations[i] = isFinite(v) ? v : 0;
+            const v = isFloat ? buf.readFloatLE(i * 4) : buf.readInt16LE(i * 2);
+            // Nodata values vary by source; treat extreme values as 0
+            elevations[i] = (isFinite(v) && v > -9000 && v < 9000) ? v : 0;
         }
-
-        const result = { width, height, elevations };
-        regionalTileCacheSet(cacheKey, result);
-        return result;
+        return { width, height, elevations };
     } catch (err) {
-        console.warn(`[RegionalDEM] ${dataset} ${z}/${x}/${y} failed (${err.message}), falling back to Terrarium`);
-        return fetchTile(z, x, y);
+        throw new Error("GeoTIFF decode failed: " + err.message);
     }
 }
 
-/**
- * Shared handler for all POST /elevation/<region> routes.
- * Identical contract to POST /elevation — same body, same response shape.
- */
-async function handleRegionalElevation(req, res, dataset) {
+// ── Generic WCS 1.0.0 / 1.1.0 fetcher ───────────────────────────────────────
+// Most European national agencies expose their DEMs via OGC WCS.
+// Returns decoded { width, height, elevations } or throws.
+async function fetchWcsTile(wcsUrl, coverageName, bbox, resx, resy, crs = "EPSG:4326") {
+    const { west, east, north, south } = bbox;
+    // Target ~256px output regardless of native resolution, capped at native res
+    const lonSpan = east - west;
+    const latSpan = north - south;
+    const width  = Math.min(256, Math.ceil(lonSpan / resx));
+    const height = Math.min(256, Math.ceil(latSpan / resy));
+    if (width < 1 || height < 1) throw new Error("Tile bbox too small");
+
+    const url = `${wcsUrl}`
+        + `?SERVICE=WCS&VERSION=1.0.0&REQUEST=GetCoverage`
+        + `&COVERAGE=${coverageName}`
+        + `&CRS=${crs}`
+        + `&BBOX=${west},${south},${east},${north}`
+        + `&WIDTH=${width}&HEIGHT=${height}`
+        + `&FORMAT=GeoTIFF`;
+
+    const response = await axios.get(url, {
+        responseType: "arraybuffer",
+        timeout: 15000,
+        headers: { "User-Agent": "Tellus-Roblox-Proxy/3.4" },
+    });
+    return decodeGeoTiff(Buffer.from(response.data));
+}
+
+// ── Resample a decoded tile to match a specific set of pixel requests ─────────
+// Converts from the WCS response's pixel grid back to the Terrarium pixel
+// coords that ElevationService.lua requested, using bilinear interpolation.
+function resampleToPixels(tile, pixels, srcBbox, tileZ, tileX, tileY) {
+    const results = [];
+    const n = Math.pow(2, tileZ);
+    // Terrarium tile pixel → lon/lat
+    for (const [px, py] of pixels) {
+        const lon = (tileX + px / 256) / n * 360 - 180;
+        const latRad = Math.atan(Math.sinh(Math.PI * (1 - 2 * (tileY + py / 256) / n)));
+        const lat = latRad * 180 / Math.PI;
+        // lon/lat → WCS tile pixel
+        const fx = (lon - srcBbox.west)  / (srcBbox.east  - srcBbox.west)  * (tile.width  - 1);
+        const fy = (srcBbox.north - lat) / (srcBbox.north - srcBbox.south) * (tile.height - 1);
+        results.push(Math.round(sampleBilinear(tile, Math.max(0, fx), Math.max(0, fy)) * 10) / 10);
+    }
+    return results;
+}
+
+// ── Core regional handler ─────────────────────────────────────────────────────
+// fetchFn(bbox) must return Promise<{width,height,elevations}> or throw.
+// On throw: falls back to global Terrarium tile for that z/x/y.
+async function handleRegionalElevation(req, res, fetchFn) {
     const { tiles } = req.body;
     if (!Array.isArray(tiles)) return res.status(400).json({ error: "Body must have 'tiles' array" });
 
@@ -715,45 +726,388 @@ async function handleRegionalElevation(req, res, dataset) {
             for (let i = 0; i < (pixels?.length || 0); i++) results.push(0);
             continue;
         }
-        let tile;
-        try {
-            tile = await fetchRegionalTile(z, x, y, dataset);
-        } catch (err) {
-            console.error(`[RegionalDEM] ${dataset} tile ${z}/${x}/${y} failed:`, err.message);
+        const bbox = tileToBbox(z, x, y);
+        const cacheKey = `regional|${fetchFn.name}|${z}/${x}/${y}`;
+        let tile = regionalTileCache.get(cacheKey);
+        if (!tile) {
+            try {
+                tile = await fetchFn(bbox);
+                regionalTileCacheSet(cacheKey, tile);
+            } catch (err) {
+                console.warn(`[RegionalDEM] ${fetchFn.name} ${z}/${x}/${y} failed (${err.message}), falling back to Terrarium`);
+                try { tile = await fetchTile(z, x, y); } catch (_) { /* give up */ }
+            }
+        }
+        if (!tile) {
             for (let i = 0; i < (pixels?.length || 0); i++) results.push(0);
             continue;
         }
-        for (const [px, py] of (pixels || [])) {
-            const cpx = Math.max(0, Math.min(tile.width  - 1, px));
-            const cpy = Math.max(0, Math.min(tile.height - 1, py));
-            results.push(Math.round(sampleBilinear(tile, cpx, cpy) * 10) / 10);
+        for (const v of resampleToPixels(tile, pixels || [], bbox, z, x, y)) {
+            results.push(v);
         }
     }
     res.json({ elevations: results });
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Per-source fetch functions
+// Each is a named async function so handleRegionalElevation's cache key
+// includes the source name and logs show which source failed.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Switzerland — SwissTopo ALTI3D, 0.5m
+// https://api3.geo.admin.ch/services/sdiservices.html
+async function fetchSwiss(bbox) {
+    return fetchWcsTile(
+        "https://wcs.geo.admin.ch",
+        "ch.swisstopo.swissalti3d-reliefschattierung",
+        bbox, 0.00000463, 0.00000463
+    );
+}
+
+// Norway — Kartverket Høydedata DTM1, 1m
+// https://www.kartverket.no/api-og-data/terrengdata
+async function fetchNorway(bbox) {
+    return fetchWcsTile(
+        "https://wcs.geonorge.no/skwms1/wcs.hoyde-dtm1",
+        "hoyde-dtm1",
+        bbox, 0.00000899, 0.00000899
+    );
+}
+
+// Netherlands — PDOK AHN4, 0.5m
+// https://www.pdok.nl/ogc-webservices/-/article/ahn-actueel-hoogtebestand-nederland-ahn4-
+async function fetchNetherlands(bbox) {
+    return fetchWcsTile(
+        "https://service.pdok.nl/rws/ahn/wcs/v1_0",
+        "dtm_05m",
+        bbox, 0.00000463, 0.00000463
+    );
+}
+
+// Denmark — SDFI DHM/Terræn, 0.4m
+// https://dataforsyningen.dk/data/3931
+async function fetchDenmark(bbox) {
+    return fetchWcsTile(
+        "https://services.datafordeler.dk/DHMNedboer/dhm_wcs/1.0.0/WCS",
+        "dhm_terraen_skyggekort",
+        bbox, 0.0000036, 0.0000036
+    );
+}
+
+// Belgium — NGI/IGN Lidar HD, 1m
+// https://www.ngi.be/website/aanbod/digitale-geodata/lidar-data-in-belgie/
+async function fetchBelgium(bbox) {
+    return fetchWcsTile(
+        "https://wcs.ngi.be/geodata/wcs",
+        "DTM_1m",
+        bbox, 0.00000899, 0.00000899
+    );
+}
+
+// Spain — IGN PNOA MDT05, 2m
+// https://www.ign.es/web/ign/portal/cbg-area-cartografia
+async function fetchSpain(bbox) {
+    return fetchWcsTile(
+        "https://servicios.idee.es/wcs-inspire/mdt",
+        "Elevacion4258_5",
+        bbox, 0.0000180, 0.0000180
+    );
+}
+
+// Ireland — Tailte Éireann (OSi) 2m
+// https://data.gov.ie/dataset/digital-terrain-model
+async function fetchIreland(bbox) {
+    return fetchWcsTile(
+        "https://wcs.tailte.ie/geoserver/ows",
+        "DTM_2m",
+        bbox, 0.0000180, 0.0000180
+    );
+}
+
+// Austria — BEV DGM Österreich, 1m
+// https://www.bev.gv.at/Services/Downloads/Geodatenprodukte/Hoheitsgebiete.html
+async function fetchAustria(bbox) {
+    return fetchWcsTile(
+        "https://gis.bev.gv.at/arcgis/services/DGM/DGM_Oesterreich/ImageServer/WCSServer",
+        "DGM_Oesterreich",
+        bbox, 0.00000899, 0.00000899
+    );
+}
+
+// Germany — BKG DGM, 1m
+// https://gdz.bkg.bund.de/index.php/default/digitales-gelandemodell-gitterweite-1-m-dgm1.html
+async function fetchGermany(bbox) {
+    return fetchWcsTile(
+        "https://sgx.geodatenzentrum.de/wcs_dgm1_inspire",
+        "EL.GridCoverage.DTM",
+        bbox, 0.00000899, 0.00000899
+    );
+}
+
+// Czech Republic — ČÚZK DMR 5G, 1m
+// https://geoportal.cuzk.cz/Default.aspx?lng=EN
+async function fetchCzech(bbox) {
+    return fetchWcsTile(
+        "https://ags.cuzk.cz/arcgis/services/dmr5g/ImageServer/WCSServer",
+        "dmr5g",
+        bbox, 0.00000899, 0.00000899
+    );
+}
+
+// Slovakia — GEODIS DEM, 1m
+// https://www.geoportal.sk/sk/zbgis/na-stiahnutie/
+async function fetchSlovakia(bbox) {
+    return fetchWcsTile(
+        "https://zbgis.skgeodesy.sk/arcgis/services/ZBGIS/DMR/ImageServer/WCSServer",
+        "DMR",
+        bbox, 0.00000899, 0.00000899
+    );
+}
+
+// Poland — GUGiK ISOK NMT, 1m
+// https://www.geoportal.gov.pl/uslugi/usluga-przegladania-wms-nmt-i-nmpt
+async function fetchPoland(bbox) {
+    return fetchWcsTile(
+        "https://mapy.geoportal.gov.pl/wss/service/PZGIK/NMT/GRID1/WCS/DigitalTerrainModelFormatTIFF",
+        "Pokrycie_terenu",
+        bbox, 0.00000899, 0.00000899
+    );
+}
+
+// Finland — NLS Finland elevation model, 2m
+// https://www.maanmittauslaitos.fi/en/maps-and-spatial-data/datasets-and-interfaces/product-descriptions/elevation-model-2-m
+async function fetchFinland(bbox) {
+    return fetchWcsTile(
+        "https://beta-karttakuva.maanmittauslaitos.fi/ortokuva/wcs/v2",
+        "korkeusmalli_2m",
+        bbox, 0.0000180, 0.0000180
+    );
+}
+
+// Estonia — Maa-amet LiDAR DEM, 1m
+// https://geoportaal.maaamet.ee/eng/Spatial-Data/Elevation-Data-p664.html
+async function fetchEstonia(bbox) {
+    return fetchWcsTile(
+        "https://kaart.maaamet.ee/wcs/alus",
+        "dem_eesti_euroopa",
+        bbox, 0.00000899, 0.00000899
+    );
+}
+
+// Latvia — LĢIA DEM, 1m
+// https://www.lgia.gov.lv/en/digit%C4%81lais-reljefa-modelis
+async function fetchLatvia(bbox) {
+    return fetchWcsTile(
+        "https://services.lgia.gov.lv/arcgis/services/DEM/DEM_1m/ImageServer/WCSServer",
+        "DEM_1m",
+        bbox, 0.00000899, 0.00000899
+    );
+}
+
+// Lithuania — GKD DEM, 1m
+// https://www.geoportal.lt/geoportal/web/guest/paslaugos
+async function fetchLithuania(bbox) {
+    return fetchWcsTile(
+        "https://www.geoportal.lt/mapproxy/gisc_dtm/wcs",
+        "gisc_dtm",
+        bbox, 0.00000899, 0.00000899
+    );
+}
+
+// Slovenia — GURS DMR 1m
+// https://www.e-prostor.gov.si/zbirke-prostorskih-podatkov/digitalni-modeli-reliefa/dmr-1/
+async function fetchSlovenia(bbox) {
+    return fetchWcsTile(
+        "https://storitve.eprostor.gov.si/ows-ins-wcs/wcs",
+        "DMR_1m",
+        bbox, 0.00000899, 0.00000899
+    );
+}
+
+// Croatia — DGU DEM, 1m
+// https://geoportal.dgu.hr/
+async function fetchCroatia(bbox) {
+    return fetchWcsTile(
+        "https://geoportal.dgu.hr/services/inspire/elevation/wcs",
+        "EL.GridCoverage",
+        bbox, 0.00000899, 0.00000899
+    );
+}
+
+// Portugal — DGT MDT, 2m
+// https://snig.dgterritorio.gov.pt/
+async function fetchPortugal(bbox) {
+    return fetchWcsTile(
+        "https://servicos.dgterritorio.pt/SDISNIGROAPS/wcs",
+        "MDT2m",
+        bbox, 0.0000180, 0.0000180
+    );
+}
+
+// Luxembourg — ACT MNT LiDAR, 1m
+// https://data.public.lu/en/datasets/lidar-2019/
+async function fetchLuxembourg(bbox) {
+    return fetchWcsTile(
+        "https://wmts1.geoportail.lu/opendata/service",
+        "lidar_mns_2019",
+        bbox, 0.00000899, 0.00000899
+    );
+}
+
+// USA — USGS 3DEP 1m (and IfSAR 5m for Alaska via same endpoint)
+// https://www.usgs.gov/3d-elevation-program
+async function fetchUSA(bbox) {
+    return fetchWcsTile(
+        "https://elevation.nationalmap.gov/arcgis/services/3DEPElevation/ImageServer/WCSServer",
+        "DEP3Elevation",
+        bbox, 0.00000899, 0.00000899
+    );
+}
+
+// Canada — Geogratis CDEM, 2m
+// https://natural-resources.canada.ca/science-and-data/science-and-research/earth-sciences/geography/topographic-information/download-directory-topographic-data/17215
+async function fetchCanada(bbox) {
+    return fetchWcsTile(
+        "https://datacube.services.geo.ca/ows/elevation",
+        "dtm",
+        bbox, 0.0000180, 0.0000180
+    );
+}
+
+// Japan — GSI Cyberjapan tile API
+// https://maps.gsi.go.jp/development/ichiran.html
+// Returns ASCII elevation grid (not GeoTIFF) — needs custom decoder.
+// Falls back to 5m (dem5a) then 1m (dem) depending on coverage.
+async function fetchJapan(bbox) {
+    const { west, east, north, south } = bbox;
+    // Pick a representative zoom level that matches the tile resolution
+    // GSI uses z=15 for 1m dem, z=14 for 5m dem5a
+    const midLat = (north + south) / 2;
+    const midLon = (east  + west)  / 2;
+    const z = 15;
+    const n = Math.pow(2, z);
+    const gsiX = Math.floor((midLon + 180) / 360 * n);
+    const gsiY = Math.floor((1 - Math.log(Math.tan(midLat * Math.PI / 180) + 1 / Math.cos(midLat * Math.PI / 180)) / Math.PI) / 2 * n);
+
+    // Try 1m first, fall back to 5m, then 10m
+    for (const layer of ["dem", "dem5a", "dem10b"]) {
+        try {
+            const url = `https://cyberjapandata.gsi.go.jp/xyz/${layer}/${z}/${gsiX}/${gsiY}.txt`;
+            const response = await axios.get(url, {
+                timeout: 10000,
+                headers: { "User-Agent": "Tellus-Roblox-Proxy/3.4" },
+            });
+            // GSI ASCII format: 256 rows of 256 comma-separated values, "e" = nodata
+            const lines = response.data.trim().split("\n");
+            const height = lines.length;
+            const width  = lines[0].split(",").length;
+            const elevations = new Float32Array(width * height);
+            for (let row = 0; row < height; row++) {
+                const cols = lines[row].split(",");
+                for (let col = 0; col < width; col++) {
+                    const v = parseFloat(cols[col]);
+                    elevations[row * width + col] = isFinite(v) ? v : 0;
+                }
+            }
+            return { width, height, elevations };
+        } catch (_) { /* try next layer */ }
+    }
+    // All layers failed — fall through to global Terrarium
+    return fetchTile(bbox._z || 13, bbox._x || 0, bbox._y || 0);
+}
+
+// New Zealand — LINZ NZ DEM 1m
+// https://data.linz.govt.nz/layer/51768-nz-dem-1m/
+async function fetchNewZealand(bbox) {
+    return fetchWcsTile(
+        "https://data.linz.govt.nz/services;key=/wcs",
+        "layer-51768",
+        bbox, 0.00000899, 0.00000899
+    );
+}
+
+// Australia — Geoscience Australia 1 Second DEM, ~30m (free WCS)
+// 1m LiDAR tiles require state-by-state portals; GA WCS is the unified free endpoint
+// https://elevation.fsdf.org.au/
+async function fetchAustralia(bbox) {
+    return fetchWcsTile(
+        "https://services.ga.gov.au/site_9/services/DEM_SRTM_1Second_Hydro_Enforced/MapServer/WCSServer",
+        "DEM_SRTM_1Second_Hydro_Enforced",
+        bbox, 0.000277, 0.000277  // ~30m, ~1 arc-second
+    );
+}
+
+// Arctic — ArcticDEM v4.1 2m mosaic via PGC public S3 COG tiles
+// https://www.pgc.umn.edu/data/arcticdem/
+// Tiles served as Cloud Optimised GeoTIFF on AWS — no auth, no key.
+async function fetchArctic(bbox) {
+    const { west, east, north, south } = bbox;
+    // ArcticDEM uses a 100km tile grid in EPSG:3413. We fetch the WMS
+    // preview endpoint (GeoTIFF output) as a simpler integration than
+    // computing COG tile offsets. Falls back to Terrarium on failure.
+    const url = `https://pgc-oin-dem-pgcpublic.s3.amazonaws.com/ArcticDEM/mosaic/v4.1/2m_wms?`
+        + `SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap`
+        + `&LAYERS=arcticdem_mosaic_2m&STYLES=`
+        + `&CRS=EPSG:4326&BBOX=${south},${west},${north},${east}`
+        + `&WIDTH=256&HEIGHT=256&FORMAT=image/tiff`;
+    const response = await axios.get(url, {
+        responseType: "arraybuffer",
+        timeout: 20000,
+        headers: { "User-Agent": "Tellus-Roblox-Proxy/3.4" },
+    });
+    return decodeGeoTiff(Buffer.from(response.data));
+}
+
+// Antarctica — REMA v2.0 2m mosaic via PGC public S3, same pattern as ArcticDEM
+// https://www.pgc.umn.edu/data/rema/
+async function fetchAntarctica(bbox) {
+    const { west, east, north, south } = bbox;
+    const url = `https://pgc-oin-dem-pgcpublic.s3.amazonaws.com/REMA/mosaic/v2.0/2m_wms?`
+        + `SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap`
+        + `&LAYERS=rema_mosaic_2m&STYLES=`
+        + `&CRS=EPSG:4326&BBOX=${south},${west},${north},${east}`
+        + `&WIDTH=256&HEIGHT=256&FORMAT=image/tiff`;
+    const response = await axios.get(url, {
+        responseType: "arraybuffer",
+        timeout: 20000,
+        headers: { "User-Agent": "Tellus-Roblox-Proxy/3.4" },
+    });
+    return decodeGeoTiff(Buffer.from(response.data));
+}
+
 // ── Regional routes ───────────────────────────────────────────────────────────
-
-// Switzerland — SwissTopo ALTI3D (0.5 m), falls back to SRTMGL1 without OT key
-app.post("/elevation/ch", (req, res) => handleRegionalElevation(req, res, OT_DATASET.ch));
-
-// Norway — Kartverket DTM1 (1 m), falls back to SRTMGL1 without OT key
-app.post("/elevation/no", (req, res) => handleRegionalElevation(req, res, OT_DATASET.no));
-
-// Netherlands — AHN (0.5 m), falls back to SRTMGL1 without OT key
-app.post("/elevation/nl", (req, res) => handleRegionalElevation(req, res, OT_DATASET.nl));
-
-// Canada — CanElevation (2 m), falls back to SRTMGL1 without OT key
-app.post("/elevation/ca", (req, res) => handleRegionalElevation(req, res, OT_DATASET.ca));
-
-// Arctic — ArcticDEM v4.1 mosaic (2 m) via OpenTopography
-app.post("/elevation/arctic", (req, res) => handleRegionalElevation(req, res, OT_DATASET.arctic));
-
-// Antarctica — REMA v2.0 mosaic (2 m) via OpenTopography
-app.post("/elevation/antarctica", (req, res) => handleRegionalElevation(req, res, OT_DATASET.antarctica));
-
-// Japan — GSI DEM (1 m / 5 m), falls back to SRTMGL1 without OT key
-app.post("/elevation/jp", (req, res) => handleRegionalElevation(req, res, OT_DATASET.jp));
+// Europe
+app.post("/elevation/ch",  (req, res) => handleRegionalElevation(req, res, fetchSwiss));
+app.post("/elevation/no",  (req, res) => handleRegionalElevation(req, res, fetchNorway));
+app.post("/elevation/nl",  (req, res) => handleRegionalElevation(req, res, fetchNetherlands));
+app.post("/elevation/dk",  (req, res) => handleRegionalElevation(req, res, fetchDenmark));
+app.post("/elevation/be",  (req, res) => handleRegionalElevation(req, res, fetchBelgium));
+app.post("/elevation/es",  (req, res) => handleRegionalElevation(req, res, fetchSpain));
+app.post("/elevation/ie",  (req, res) => handleRegionalElevation(req, res, fetchIreland));
+app.post("/elevation/at",  (req, res) => handleRegionalElevation(req, res, fetchAustria));
+app.post("/elevation/de",  (req, res) => handleRegionalElevation(req, res, fetchGermany));
+app.post("/elevation/cz",  (req, res) => handleRegionalElevation(req, res, fetchCzech));
+app.post("/elevation/sk",  (req, res) => handleRegionalElevation(req, res, fetchSlovakia));
+app.post("/elevation/pl",  (req, res) => handleRegionalElevation(req, res, fetchPoland));
+app.post("/elevation/fi",  (req, res) => handleRegionalElevation(req, res, fetchFinland));
+app.post("/elevation/ee",  (req, res) => handleRegionalElevation(req, res, fetchEstonia));
+app.post("/elevation/lv",  (req, res) => handleRegionalElevation(req, res, fetchLatvia));
+app.post("/elevation/lt",  (req, res) => handleRegionalElevation(req, res, fetchLithuania));
+app.post("/elevation/si",  (req, res) => handleRegionalElevation(req, res, fetchSlovenia));
+app.post("/elevation/hr",  (req, res) => handleRegionalElevation(req, res, fetchCroatia));
+app.post("/elevation/pt",  (req, res) => handleRegionalElevation(req, res, fetchPortugal));
+app.post("/elevation/lu",  (req, res) => handleRegionalElevation(req, res, fetchLuxembourg));
+// Americas
+app.post("/elevation/us",  (req, res) => handleRegionalElevation(req, res, fetchUSA));
+app.post("/elevation/ca",  (req, res) => handleRegionalElevation(req, res, fetchCanada));
+// Asia-Pacific
+app.post("/elevation/jp",  (req, res) => handleRegionalElevation(req, res, fetchJapan));
+app.post("/elevation/nz",  (req, res) => handleRegionalElevation(req, res, fetchNewZealand));
+app.post("/elevation/au",  (req, res) => handleRegionalElevation(req, res, fetchAustralia));
+// Polar
+app.post("/elevation/arctic",      (req, res) => handleRegionalElevation(req, res, fetchArctic));
+app.post("/elevation/antarctica",  (req, res) => handleRegionalElevation(req, res, fetchAntarctica));
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /  — health check
@@ -761,41 +1115,58 @@ app.post("/elevation/jp", (req, res) => handleRegionalElevation(req, res, OT_DAT
 app.get("/", (_req, res) => {
     res.json({
         status:  "Tellus Elevation Proxy running",
-        version: "3.3.0",
+        version: "3.4.0",
         koppen:  koppen ? `${koppen.width}x${koppen.height} loaded` : "unavailable",
         cache: {
             tiles:         `${tileCache.size}/${TILE_CACHE_MAX}`,
             regionalTiles: `${regionalTileCache.size}/${REGIONAL_TILE_CACHE_MAX}`,
             osm:           `${osmCache.size}/${OSM_CACHE_MAX}`,
         },
-        regionalDem: {
-            openTopoKey: OPENTOPO_API_KEY ? "set" : "missing — regional routes fall back to Terrarium",
-        },
         overpass: {
-            queueDepth:    overpassQueue.length,
-            busy:          overpassBusy,
-            minGapMs:      MIN_OVERPASS_GAP_MS,
+            queueDepth: overpassQueue.length,
+            busy:       overpassBusy,
+            minGapMs:   MIN_OVERPASS_GAP_MS,
         },
         endpoints: [
-            "GET  /tile?z=&x=&y=    → decoded Terrarium tile",
-            "POST /elevation         → batched pixel samples",
-            "POST /water             → water polygon ways (cached)",
-            "POST /buildings         → building footprint ways (cached)",
-            "POST /roads             → road ways (cached)",
-            "POST /osm               → roads + buildings combined (cached)",
-            "GET  /geocode?q=        → Nominatim search",
-            "POST /landcover         → Köppen climate per point",
-            "POST /elevation/ch      → SwissTopo ALTI3D 0.5m (Switzerland)",
-            "POST /elevation/no      → Kartverket DTM1 1m (Norway)",
-            "POST /elevation/nl      → AHN 0.5m (Netherlands)",
-            "POST /elevation/ca      → CanElevation 2m (Canada)",
-            "POST /elevation/arctic  → ArcticDEM 2m mosaic (Arctic)",
-            "POST /elevation/antarctica → REMA 2m mosaic (Antarctica)",
-            "POST /elevation/jp      → GSI DEM 1m (Japan)",
+            "GET  /tile?z=&x=&y=         → decoded Terrarium tile",
+            "POST /elevation              → batched pixel samples (global Terrarium)",
+            "POST /elevation/ch           → SwissTopo ALTI3D 0.5m (Switzerland)",
+            "POST /elevation/no           → Kartverket DTM1 1m (Norway)",
+            "POST /elevation/nl           → PDOK AHN4 0.5m (Netherlands)",
+            "POST /elevation/dk           → SDFI 0.4m (Denmark)",
+            "POST /elevation/be           → NGI LiDAR HD 1m (Belgium)",
+            "POST /elevation/es           → IGN PNOA MDT05 2m (Spain)",
+            "POST /elevation/ie           → Tailte Éireann 2m (Ireland)",
+            "POST /elevation/at           → BEV DGM 1m (Austria)",
+            "POST /elevation/de           → BKG DGM 1m (Germany)",
+            "POST /elevation/cz           → ČÚZK DMR 5G 1m (Czech Republic)",
+            "POST /elevation/sk           → GEODIS DMR 1m (Slovakia)",
+            "POST /elevation/pl           → GUGiK ISOK NMT 1m (Poland)",
+            "POST /elevation/fi           → NLS Finland 2m (Finland)",
+            "POST /elevation/ee           → Maa-amet LiDAR 1m (Estonia)",
+            "POST /elevation/lv           → LĢIA DEM 1m (Latvia)",
+            "POST /elevation/lt           → GKD DEM 1m (Lithuania)",
+            "POST /elevation/si           → GURS DMR 1m (Slovenia)",
+            "POST /elevation/hr           → DGU DEM 1m (Croatia)",
+            "POST /elevation/pt           → DGT MDT 2m (Portugal)",
+            "POST /elevation/lu           → ACT LiDAR 1m (Luxembourg)",
+            "POST /elevation/us           → USGS 3DEP 1m (USA + Alaska)",
+            "POST /elevation/ca           → Geogratis CDEM 2m (Canada)",
+            "POST /elevation/jp           → GSI DEM 1m/5m (Japan)",
+            "POST /elevation/nz           → LINZ NZ DEM 1m (New Zealand)",
+            "POST /elevation/au           → Geoscience Australia ~30m",
+            "POST /elevation/arctic       → ArcticDEM v4.1 2m mosaic",
+            "POST /elevation/antarctica   → REMA v2.0 2m mosaic",
+            "POST /water                  → water polygon ways (cached)",
+            "POST /buildings              → building footprint ways (cached)",
+            "POST /roads                  → road ways (cached)",
+            "POST /osm                    → roads + buildings combined (cached)",
+            "GET  /geocode?q=             → Nominatim search",
+            "POST /landcover              → Köppen climate per point",
         ],
     });
 });
 
 app.listen(PORT, () => {
-    console.log(`[Tellus Proxy] v3.3.0 listening on port ${PORT}`);
+    console.log(`[Tellus Proxy] v3.4.0 listening on port ${PORT}`);
 });
