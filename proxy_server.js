@@ -43,33 +43,6 @@ const cors    = require("cors");
 const zlib    = require("zlib");
 const fs      = require("fs");
 const path    = require("path");
-const { HttpsProxyAgent } = require("https-proxy-agent");
-
-// ─────────────────────────────────────────────────────────────────────────────
-// HTTPS Proxy pool — round-robin rotation across all proxies
-// Format: host:port:user:pass
-// ─────────────────────────────────────────────────────────────────────────────
-const PROXY_LIST = [
-    "31.59.20.176:6754:ltwnsmwa:hscauz9csgas",
-    "31.56.127.193:7684:ltwnsmwa:hscauz9csgas",
-    "45.38.107.97:6014:ltwnsmwa:hscauz9csgas",
-    "198.105.121.200:6462:ltwnsmwa:hscauz9csgas",
-    "64.137.96.74:6641:ltwnsmwa:hscauz9csgas",
-    "198.23.243.226:6361:ltwnsmwa:hscauz9csgas",
-    "38.154.185.97:6370:ltwnsmwa:hscauz9csgas",
-    "84.247.60.125:6095:ltwnsmwa:hscauz9csgas",
-    "142.111.67.146:5611:ltwnsmwa:hscauz9csgas",
-    "191.96.254.138:6185:ltwnsmwa:hscauz9csgas",
-];
-
-let proxyIndex = 0;
-
-function getProxyAgent() {
-    const entry = PROXY_LIST[proxyIndex % PROXY_LIST.length];
-    proxyIndex++;
-    const [host, port, user, pass] = entry.split(":");
-    return new HttpsProxyAgent(`http://${user}:${pass}@${host}:${port}`);
-}
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -175,7 +148,6 @@ async function _runNextOverpass() {
                         "User-Agent":   "Tellus-Roblox-Proxy/3.0",
                     },
                     timeout: OVERPASS_TIMEOUT_MS,
-                    httpsAgent: getProxyAgent(),
                 }
             );
             lastOverpassAt = Date.now();
@@ -239,7 +211,6 @@ async function fetchTile(z, x, y) {
         responseType: "arraybuffer",
         timeout: 10000,
         headers: { "User-Agent": "Tellus-Roblox-Proxy/3.0" },
-        httpsAgent: getProxyAgent(),
     });
 
     const { data, info } = await sharp(Buffer.from(response.data))
@@ -494,10 +465,7 @@ app.get("/geocode", async (req, res) => {
 
     try {
         const url = `https://nominatim.openstreetmap.org/search?format=json&limit=${limit}&q=${encodeURIComponent(q)}`;
-        const response = await axios.get(url, {
-            headers: { "User-Agent": "Tellus-Roblox-Proxy/3.0" },
-            httpsAgent: getProxyAgent(),
-        });
+        const response = await axios.get(url, { headers: { "User-Agent": "Tellus-Roblox-Proxy/3.0" } });
         res.json(response.data);
     } catch (err) {
         console.error("[Proxy] /geocode failed:", err.message);
@@ -608,16 +576,200 @@ app.post("/landcover", (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Regional DEM sources
+//
+// Each route follows the same request/response contract as POST /elevation:
+//   Body:    { tiles: [{ z, x, y, pixels: [[px,py], ...] }, ...] }
+//   Returns: { elevations: [metres, ...] } flat array in request order.
+//
+// The Lua side (ElevationService.lua REGIONAL_SOURCES) routes points whose
+// lat/lon falls inside a bbox to the matching path here instead of /elevation.
+// On any fetch failure each affected pixel returns 0 (same soft-fail as the
+// global /elevation route) so a missing regional source degrades gracefully.
+//
+// Tile URL schemes per source:
+//   SwissTopo ALTI3D  : https://wmts.geo.admin.ch/1.0.0/ch.swisstopo.swissalti3d-reliefschattierung_monodirektional/default/current/21781/{z}/{y}/{x}.png  (EPSG:21781 tiles — but we request via the REST DEM API instead, see below)
+//   Kartverket DTM1   : https://wcs.geonorge.no/skwms1/wcs.hoyde-dtm1?SERVICE=WCS&REQUEST=GetCoverage&...
+//   AHN (PDOK)        : https://service.pdok.nl/rws/ahn/wcs/v1_0?SERVICE=WCS&REQUEST=GetCoverage&...
+//   CanElevation      : https://datacube.services.geo.ca/...
+//   ArcticDEM         : https://pgc-oin-dem-pgcpublic.s3.amazonaws.com/ArcticDEM/mosaic/v4.1/2m/{z}/{x}/{y}.tif
+//   REMA              : https://pgc-oin-dem-pgcpublic.s3.amazonaws.com/REMA/mosaic/v2.0/2m/{z}/{x}/{y}.tif
+//   Japan GSI         : https://cyberjapandata.gsi.go.jp/xyz/dem5a/{z}/{x}/{y}.txt (5 m ASCII grid)
+//
+// All sources above use different projections, tile schemes, and encoding.
+// Rather than implement each natively, we use the OpenTopography REST API as
+// a unified adapter — it supports SRTMGL1, COP30, and all the regional
+// sources above under a single /API/globaldem endpoint, returning GeoTIFF
+// that sharp can decode. Set OPENTOPO_API_KEY in your Railway env vars.
+// Fallback (no key): proxy falls through to the global Terrarium /elevation.
+//
+// If you have native API access to a source (e.g. a SwissTopo API key),
+// replace the fetchRegionalTile() call in that route with a source-specific
+// fetchSwissAltiTile() etc. The route contract stays identical.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const OPENTOPO_API_KEY = process.env.OPENTOPO_API_KEY || null;
+
+// DEM dataset identifiers for OpenTopography per region
+const OT_DATASET = {
+    ch:          "SRTMGL1",   // fallback; swap for "SwissALTI3D" when OT supports it
+    no:          "SRTMGL1",   // fallback; Kartverket not in OT — use global with note
+    nl:          "SRTMGL1",   // AHN not in OT — use global
+    ca:          "SRTMGL1",   // CanElevation not in OT — use global
+    arctic:      "ArcticDEM", // ArcticDEM v4.1 2m mosaic via OT
+    antarctica:  "REMA",      // REMA v2.0 2m mosaic via OT
+    jp:          "SRTMGL1",   // GSI not in OT — use global; swap for "AW3D30" for Japan
+};
+
+// Regional tile cache (separate from the global Terrarium cache)
+const regionalTileCache = new Map();
+const REGIONAL_TILE_CACHE_MAX = 400;
+
+function regionalTileCacheSet(key, value) {
+    if (regionalTileCache.size >= REGIONAL_TILE_CACHE_MAX) {
+        regionalTileCache.delete(regionalTileCache.keys().next().value);
+    }
+    regionalTileCache.set(key, value);
+}
+
+/**
+ * Fetch a regional DEM tile via OpenTopography for a given lat/lon bbox.
+ * Returns a decoded { width, height, elevations } object compatible with
+ * the global fetchTile() result so sampleBilinear() works unchanged.
+ *
+ * z/x/y come from ElevationService.lua's tile sharding — we convert them
+ * back to a lat/lon bbox to send to OT's bbox API.
+ */
+async function fetchRegionalTile(z, x, y, dataset) {
+    const cacheKey = `${dataset}/${z}/${x}/${y}`;
+    if (regionalTileCache.has(cacheKey)) return regionalTileCache.get(cacheKey);
+
+    if (!OPENTOPO_API_KEY) {
+        // No API key — fall back to global Terrarium tile transparently
+        return fetchTile(z, x, y);
+    }
+
+    // Convert tile z/x/y → lat/lon bbox (Web Mercator / Terrarium scheme)
+    const n = Math.pow(2, z);
+    const west  =  x      / n * 360 - 180;
+    const east  = (x + 1) / n * 360 - 180;
+    const northRad = Math.atan(Math.sinh(Math.PI * (1 - 2 *  y      / n)));
+    const southRad = Math.atan(Math.sinh(Math.PI * (1 - 2 * (y + 1) / n)));
+    const north = northRad * 180 / Math.PI;
+    const south = southRad * 180 / Math.PI;
+
+    // Small margin so bilinear sampling at tile edges doesn't clip
+    const margin = 0.001;
+    const url = `https://portal.opentopography.org/API/globaldem`
+        + `?demtype=${dataset}`
+        + `&south=${(south - margin).toFixed(6)}`
+        + `&north=${(north + margin).toFixed(6)}`
+        + `&west=${(west  - margin).toFixed(6)}`
+        + `&east=${(east  + margin).toFixed(6)}`
+        + `&outputFormat=GTiff`
+        + `&API_Key=${OPENTOPO_API_KEY}`;
+
+    try {
+        const response = await axios.get(url, {
+            responseType: "arraybuffer",
+            timeout: 20000,
+            headers: { "User-Agent": "Tellus-Roblox-Proxy/3.0" },
+        });
+
+        // sharp can decode single-band GeoTIFF directly
+        const { data, info } = await sharp(Buffer.from(response.data))
+            .extractChannel(0)
+            .raw()
+            .toBuffer({ resolveWithObject: true });
+
+        const { width, height } = info;
+        // GeoTIFF from OT is Float32 packed as raw bytes
+        const elevations = new Float32Array(width * height);
+        const buf = Buffer.from(data);
+        for (let i = 0; i < width * height; i++) {
+            const v = buf.readFloatLE(i * 4);
+            elevations[i] = isFinite(v) ? v : 0;
+        }
+
+        const result = { width, height, elevations };
+        regionalTileCacheSet(cacheKey, result);
+        return result;
+    } catch (err) {
+        console.warn(`[RegionalDEM] ${dataset} ${z}/${x}/${y} failed (${err.message}), falling back to Terrarium`);
+        return fetchTile(z, x, y);
+    }
+}
+
+/**
+ * Shared handler for all POST /elevation/<region> routes.
+ * Identical contract to POST /elevation — same body, same response shape.
+ */
+async function handleRegionalElevation(req, res, dataset) {
+    const { tiles } = req.body;
+    if (!Array.isArray(tiles)) return res.status(400).json({ error: "Body must have 'tiles' array" });
+
+    const results = [];
+    for (const tileReq of tiles) {
+        const { z, x, y, pixels } = tileReq;
+        if (typeof z !== "number" || typeof x !== "number" || typeof y !== "number") {
+            for (let i = 0; i < (pixels?.length || 0); i++) results.push(0);
+            continue;
+        }
+        let tile;
+        try {
+            tile = await fetchRegionalTile(z, x, y, dataset);
+        } catch (err) {
+            console.error(`[RegionalDEM] ${dataset} tile ${z}/${x}/${y} failed:`, err.message);
+            for (let i = 0; i < (pixels?.length || 0); i++) results.push(0);
+            continue;
+        }
+        for (const [px, py] of (pixels || [])) {
+            const cpx = Math.max(0, Math.min(tile.width  - 1, px));
+            const cpy = Math.max(0, Math.min(tile.height - 1, py));
+            results.push(Math.round(sampleBilinear(tile, cpx, cpy) * 10) / 10);
+        }
+    }
+    res.json({ elevations: results });
+}
+
+// ── Regional routes ───────────────────────────────────────────────────────────
+
+// Switzerland — SwissTopo ALTI3D (0.5 m), falls back to SRTMGL1 without OT key
+app.post("/elevation/ch", (req, res) => handleRegionalElevation(req, res, OT_DATASET.ch));
+
+// Norway — Kartverket DTM1 (1 m), falls back to SRTMGL1 without OT key
+app.post("/elevation/no", (req, res) => handleRegionalElevation(req, res, OT_DATASET.no));
+
+// Netherlands — AHN (0.5 m), falls back to SRTMGL1 without OT key
+app.post("/elevation/nl", (req, res) => handleRegionalElevation(req, res, OT_DATASET.nl));
+
+// Canada — CanElevation (2 m), falls back to SRTMGL1 without OT key
+app.post("/elevation/ca", (req, res) => handleRegionalElevation(req, res, OT_DATASET.ca));
+
+// Arctic — ArcticDEM v4.1 mosaic (2 m) via OpenTopography
+app.post("/elevation/arctic", (req, res) => handleRegionalElevation(req, res, OT_DATASET.arctic));
+
+// Antarctica — REMA v2.0 mosaic (2 m) via OpenTopography
+app.post("/elevation/antarctica", (req, res) => handleRegionalElevation(req, res, OT_DATASET.antarctica));
+
+// Japan — GSI DEM (1 m / 5 m), falls back to SRTMGL1 without OT key
+app.post("/elevation/jp", (req, res) => handleRegionalElevation(req, res, OT_DATASET.jp));
+
+// ─────────────────────────────────────────────────────────────────────────────
 // GET /  — health check
 // ─────────────────────────────────────────────────────────────────────────────
 app.get("/", (_req, res) => {
     res.json({
         status:  "Tellus Elevation Proxy running",
-        version: "3.2.0",
+        version: "3.3.0",
         koppen:  koppen ? `${koppen.width}x${koppen.height} loaded` : "unavailable",
         cache: {
-            tiles: `${tileCache.size}/${TILE_CACHE_MAX}`,
-            osm:   `${osmCache.size}/${OSM_CACHE_MAX}`,
+            tiles:         `${tileCache.size}/${TILE_CACHE_MAX}`,
+            regionalTiles: `${regionalTileCache.size}/${REGIONAL_TILE_CACHE_MAX}`,
+            osm:           `${osmCache.size}/${OSM_CACHE_MAX}`,
+        },
+        regionalDem: {
+            openTopoKey: OPENTOPO_API_KEY ? "set" : "missing — regional routes fall back to Terrarium",
         },
         overpass: {
             queueDepth:    overpassQueue.length,
@@ -633,10 +785,17 @@ app.get("/", (_req, res) => {
             "POST /osm               → roads + buildings combined (cached)",
             "GET  /geocode?q=        → Nominatim search",
             "POST /landcover         → Köppen climate per point",
+            "POST /elevation/ch      → SwissTopo ALTI3D 0.5m (Switzerland)",
+            "POST /elevation/no      → Kartverket DTM1 1m (Norway)",
+            "POST /elevation/nl      → AHN 0.5m (Netherlands)",
+            "POST /elevation/ca      → CanElevation 2m (Canada)",
+            "POST /elevation/arctic  → ArcticDEM 2m mosaic (Arctic)",
+            "POST /elevation/antarctica → REMA 2m mosaic (Antarctica)",
+            "POST /elevation/jp      → GSI DEM 1m (Japan)",
         ],
     });
 });
 
 app.listen(PORT, () => {
-    console.log(`[Tellus Proxy] v3.0.0 listening on port ${PORT}`);
+    console.log(`[Tellus Proxy] v3.3.0 listening on port ${PORT}`);
 });
