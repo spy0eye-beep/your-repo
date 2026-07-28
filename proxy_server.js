@@ -168,11 +168,16 @@ async function _runNextOverpass() {
         } catch (err) {
             lastErr = err;
             const status = err.response?.status;
-            if (status === 429 || status === 504) {
+            // Only sleep if there's another attempt coming — previously this
+            // branch always slept (up to 60s for a 429), even on the LAST
+            // attempt right before giving up, needlessly blocking every other
+            // request queued behind this one (overpassBusy stays true for
+            // the whole retry loop).
+            if ((status === 429 || status === 504) && attempt < OVERPASS_MAX_RETRIES) {
                 const wait = status === 429 ? 60000 : OVERPASS_RETRY_DELAY;
                 console.warn(`[Overpass] ${status} attempt ${attempt} via proxy ${(_wsIdx-1) % webshareAgents.length}, waiting ${wait}ms`);
                 await new Promise(r => setTimeout(r, wait));
-            } else if (attempt < OVERPASS_MAX_RETRIES) {
+            } else if (status !== 429 && status !== 504 && attempt < OVERPASS_MAX_RETRIES) {
                 await new Promise(r => setTimeout(r, OVERPASS_RETRY_DELAY));
             }
         }
@@ -194,6 +199,14 @@ function postOverpass(query) {
 // ─────────────────────────────────────────────────────────────────────────────
 // Parse bbox from request body
 // ─────────────────────────────────────────────────────────────────────────────
+// Real callers (roads/water/buildings radius, default 400-440m) only ever
+// need boxes on the order of 0.01deg^2. 1 deg^2 (~111km x 111km at the
+// equator) is generous headroom while still rejecting planet-scale/inverted
+// boxes that would otherwise turn into a huge, expensive Overpass query
+// hitting the shared overpass-api.de endpoint (and Webshare IPs) for
+// everyone using this proxy instance.
+const MAX_BBOX_AREA_DEG2 = 1.0;
+
 function parseBbox(body) {
     const { minLat, minLon, maxLat, maxLon } = body;
     if (minLat == null || minLon == null || maxLat == null || maxLon == null)
@@ -201,6 +214,11 @@ function parseBbox(body) {
     const s = parseFloat(minLat), w = parseFloat(minLon);
     const n = parseFloat(maxLat), e = parseFloat(maxLon);
     if ([s, w, n, e].some(isNaN)) return { error: "Bounding box values must be numbers" };
+    if (s < -90 || s > 90 || n < -90 || n > 90) return { error: "Latitude out of range (-90..90)" };
+    if (w < -180 || w > 180 || e < -180 || e > 180) return { error: "Longitude out of range (-180..180)" };
+    if (s >= n) return { error: "minLat must be less than maxLat" };
+    if (w >= e) return { error: "minLon must be less than maxLon" };
+    if ((n - s) * (e - w) > MAX_BBOX_AREA_DEG2) return { error: "Bounding box too large" };
     return { minLat: s, minLon: w, maxLat: n, maxLon: e };
 }
 
@@ -269,28 +287,45 @@ app.get("/tile", async (req, res) => {
 // POST /elevation  —  batch pixel samples (global Terrarium)
 // ─────────────────────────────────────────────────────────────────────────────
 app.post("/elevation", async (req, res) => {
-    const { tiles } = req.body;
-    if (!Array.isArray(tiles)) return res.status(400).json({ error: "Body must have 'tiles' array" });
+    try {
+        const { tiles } = req.body;
+        if (!Array.isArray(tiles)) return res.status(400).json({ error: "Body must have 'tiles' array" });
 
-    const results = [];
-    for (const tileReq of tiles) {
-        const { z, x, y, pixels } = tileReq;
-        if (typeof z!=="number"||typeof x!=="number"||typeof y!=="number") {
-            for (let i=0;i<(pixels?.length||0);i++) results.push(0); continue;
-        }
-        let tile;
-        try { tile = await fetchTile(z, x, y); }
-        catch (err) {
-            console.error(`[Proxy] /elevation tile ${z}/${x}/${y} failed:`, err.message);
-            for (let i=0;i<(pixels?.length||0);i++) results.push(0); continue;
-        }
-        for (const [px,py] of (pixels||[])) {
-            const cpx = Math.max(0,Math.min(tile.width-1,px));
-            const cpy = Math.max(0,Math.min(tile.height-1,py));
-            results.push(Math.round(sampleBilinear(tile,cpx,cpy)*10)/10);
-        }
+        // Tiles are fetched in PARALLEL (was a sequential for-await loop) —
+        // Promise.all preserves array order, so the flattened result stays
+        // in the same tile-by-tile, pixel-by-pixel order the Roblox side
+        // expects, but one slow/dead tile no longer stalls the whole batch.
+        const perTile = await Promise.all(tiles.map(async (tileReq) => {
+            const { z, x, y, pixels } = tileReq || {};
+            const pxList = Array.isArray(pixels) ? pixels : [];
+            if (typeof z!=="number"||typeof x!=="number"||typeof y!=="number") {
+                return pxList.map(() => 0);
+            }
+            let tile;
+            try { tile = await fetchTile(z, x, y); }
+            catch (err) {
+                console.error(`[Proxy] /elevation tile ${z}/${x}/${y} failed:`, err.message);
+                return pxList.map(() => 0);
+            }
+            return pxList.map((entry) => {
+                // A malformed entry (not a [x,y] pair) used to throw here,
+                // uncaught, which could crash the whole process — see the
+                // try/catch wrapping this whole handler.
+                if (!Array.isArray(entry) || typeof entry[0] !== "number" || typeof entry[1] !== "number") {
+                    return 0;
+                }
+                const [px, py] = entry;
+                const cpx = Math.max(0,Math.min(tile.width-1,px));
+                const cpy = Math.max(0,Math.min(tile.height-1,py));
+                return Math.round(sampleBilinear(tile,cpx,cpy)*10)/10;
+            });
+        }));
+
+        res.json({ elevations: perTile.flat() });
+    } catch (err) {
+        console.error("[Proxy] /elevation failed:", err.message);
+        res.status(500).json({ error: "Elevation batch failed", detail: err.message });
     }
-    res.json({ elevations: results });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -408,10 +443,13 @@ app.post("/roads", async (req, res) => {
 // GET /geocode
 // ─────────────────────────────────────────────────────────────────────────────
 app.get("/geocode", async (req, res) => {
-    const q=req.query.q, limit=req.query.limit||5;
+    const q=req.query.q;
     if (!q) return res.status(400).json({ error: "Missing query 'q'" });
+    let limit = parseInt(req.query.limit, 10);
+    if (!Number.isFinite(limit) || limit < 1) limit = 5;
+    limit = Math.min(limit, 20);
     try {
-        const url=`https://nominatim.openstreetmap.org/search?format=json&limit=${limit}&q=${encodeURIComponent(q)}`;
+        const url=`https://nominatim.openstreetmap.org/search?format=json&limit=${encodeURIComponent(limit)}&q=${encodeURIComponent(q)}`;
         const response=await axios.get(url,{headers:{"User-Agent":"Tellus-Roblox-Proxy/3.5"}});
         res.json(response.data);
     } catch(err) {
@@ -536,7 +574,14 @@ async function fetchWcsTile(wcsUrl,coverageName,bbox,resx,resy,crs="EPSG:4326") 
 
 function resampleToPixels(tile,pixels,srcBbox,tileZ,tileX,tileY) {
     const results=[], n=Math.pow(2,tileZ);
-    for (const [px,py] of pixels) {
+    for (const entry of pixels) {
+        // See /elevation's handler — a malformed entry used to throw here
+        // uncaught instead of degrading to 0.
+        if (!Array.isArray(entry) || typeof entry[0] !== "number" || typeof entry[1] !== "number") {
+            results.push(0);
+            continue;
+        }
+        const [px,py] = entry;
         const lon=(tileX+px/256)/n*360-180;
         const lat=Math.atan(Math.sinh(Math.PI*(1-2*(tileY+py/256)/n)))*180/Math.PI;
         const fx=(lon-srcBbox.west)/(srcBbox.east-srcBbox.west)*(tile.width-1);
@@ -547,28 +592,38 @@ function resampleToPixels(tile,pixels,srcBbox,tileZ,tileX,tileY) {
 }
 
 async function handleRegionalElevation(req,res,fetchFn) {
-    const {tiles}=req.body;
-    if (!Array.isArray(tiles)) return res.status(400).json({error:"Body must have 'tiles' array"});
-    const results=[];
-    for (const tileReq of tiles) {
-        const {z,x,y,pixels}=tileReq;
-        if (typeof z!=="number"||typeof x!=="number"||typeof y!=="number") {
-            for (let i=0;i<(pixels?.length||0);i++) results.push(0); continue;
-        }
-        const bbox=tileToBbox(z,x,y);
-        const cacheKey=`regional|${fetchFn.name}|${z}/${x}/${y}`;
-        let tile=regionalTileCache.get(cacheKey);
-        if (!tile) {
-            try { tile=await fetchFn(bbox); regionalTileCacheSet(cacheKey,tile); }
-            catch(err) {
-                console.warn(`[RegionalDEM] ${fetchFn.name} ${z}/${x}/${y} failed (${err.message}), falling back to Terrarium`);
-                try { tile=await fetchTile(z,x,y); } catch(_) {}
+    try {
+        const {tiles}=req.body;
+        if (!Array.isArray(tiles)) return res.status(400).json({error:"Body must have 'tiles' array"});
+
+        // Parallel per-tile fetch — see /elevation for why (order preserved
+        // by Promise.all, one slow/dead regional source no longer stalls
+        // the whole batch).
+        const perTile = await Promise.all(tiles.map(async (tileReq) => {
+            const {z,x,y,pixels}=tileReq || {};
+            const pxList = Array.isArray(pixels) ? pixels : [];
+            if (typeof z!=="number"||typeof x!=="number"||typeof y!=="number") {
+                return pxList.map(() => 0);
             }
-        }
-        if (!tile) { for (let i=0;i<(pixels?.length||0);i++) results.push(0); continue; }
-        for (const v of resampleToPixels(tile,pixels||[],bbox,z,x,y)) results.push(v);
+            const bbox=tileToBbox(z,x,y);
+            const cacheKey=`regional|${fetchFn.name}|${z}/${x}/${y}`;
+            let tile=regionalTileCache.get(cacheKey);
+            if (!tile) {
+                try { tile=await fetchFn(bbox); regionalTileCacheSet(cacheKey,tile); }
+                catch(err) {
+                    console.warn(`[RegionalDEM] ${fetchFn.name} ${z}/${x}/${y} failed (${err.message}), falling back to Terrarium`);
+                    try { tile=await fetchTile(z,x,y); } catch(_) {}
+                }
+            }
+            if (!tile) return pxList.map(() => 0);
+            return resampleToPixels(tile,pxList,bbox,z,x,y);
+        }));
+
+        res.json({elevations: perTile.flat()});
+    } catch (err) {
+        console.error(`[Proxy] regional elevation (${fetchFn.name}) failed:`, err.message);
+        res.status(500).json({ error: "Elevation batch failed", detail: err.message });
     }
-    res.json({elevations:results});
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
