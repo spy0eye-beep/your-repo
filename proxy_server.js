@@ -569,7 +569,14 @@ async function fetchWcsTile(wcsUrl,coverageName,bbox,resx,resy,crs="EPSG:4326") 
     if (width<1||height<1) throw new Error("Tile bbox too small");
     const url=`${wcsUrl}?SERVICE=WCS&VERSION=1.0.0&REQUEST=GetCoverage&COVERAGE=${coverageName}&CRS=${crs}&BBOX=${west},${south},${east},${north}&WIDTH=${width}&HEIGHT=${height}&FORMAT=GeoTIFF`;
     const response=await axios.get(url,{responseType:"arraybuffer",timeout:15000,headers:{"User-Agent":"Tellus-Roblox-Proxy/3.5"}});
-    return decodeGeoTiff(Buffer.from(response.data));
+    const decoded=await decodeGeoTiff(Buffer.from(response.data));
+    // Tag with the bbox this data ACTUALLY covers (== the requested bbox,
+    // since the WCS request itself was for exactly this bbox) so
+    // handleRegionalElevation can resample against real coverage instead of
+    // assuming it matches the caller's tile grid. See fetchJapan for why
+    // that assumption is NOT always true.
+    decoded.bbox=bbox;
+    return decoded;
 }
 
 function resampleToPixels(tile,pixels,srcBbox,tileZ,tileX,tileY) {
@@ -616,7 +623,12 @@ async function handleRegionalElevation(req,res,fetchFn) {
                 }
             }
             if (!tile) return pxList.map(() => 0);
-            return resampleToPixels(tile,pxList,bbox,z,x,y);
+            // Use the tile's OWN real coverage bbox when it reports one
+            // (fetchJapan's GSI tile covers a much smaller area than the
+            // requested zoom-13 bbox — see fetchJapan). Falls back to the
+            // requested bbox for every other regional source, whose WCS
+            // fetch always covers exactly what was asked for.
+            return resampleToPixels(tile,pxList,tile.bbox||bbox,z,x,y);
         }));
 
         res.json({elevations: perTile.flat()});
@@ -735,12 +747,26 @@ async function fetchCanada(bbox) {
 }
 
 // Japan — GSI Cyberjapan ASCII grid (not GeoTIFF)
+// FIXED (v11.5): this picks a SINGLE zoom-15 GSI tile centered on the
+// requested bbox's midpoint — but the caller's bbox is a zoom-13 Terrarium
+// tile, roughly 4x wider/taller (16x the area) than what a zoom-15 tile
+// actually covers on the ground. handleRegionalElevation used to resample
+// against the CALLER's (too-big) bbox regardless, silently stretching this
+// tile's real ~1km-wide data across an assumed ~4km-wide area — samples
+// near the requested tile's edges landed on the wrong side of real terrain
+// features, producing large false elevation swings (this is what caused
+// the "floating cliff"/inverted-cone artifacts specifically in Japan, e.g.
+// Mount Fuji, while identical requests elsewhere used the correctly-scoped
+// global Terrarium path and never showed it). Now returns bbox = the GSI
+// tile's OWN real coverage, so resampleToPixels can use ITS actual extent
+// instead of assuming it matches the caller's much larger tile.
 async function fetchJapan(bbox) {
     const {west,east,north,south}=bbox;
     const midLat=(north+south)/2, midLon=(east+west)/2;
     const z=15, n=Math.pow(2,z);
     const gsiX=Math.floor((midLon+180)/360*n);
     const gsiY=Math.floor((1-Math.log(Math.tan(midLat*Math.PI/180)+1/Math.cos(midLat*Math.PI/180))/Math.PI)/2*n);
+    const gsiBbox=tileToBbox(z,gsiX,gsiY);
     for (const layer of ["dem","dem5a","dem10b"]) {
         try {
             const url=`https://cyberjapandata.gsi.go.jp/xyz/${layer}/${z}/${gsiX}/${gsiY}.txt`;
@@ -755,7 +781,7 @@ async function fetchJapan(bbox) {
                     elevations[row*width+col]=isFinite(v)?v:0;
                 }
             }
-            return {width,height,elevations};
+            return {width,height,elevations,bbox:gsiBbox};
         } catch(_) {}
     }
     throw new Error("All GSI layers failed");
