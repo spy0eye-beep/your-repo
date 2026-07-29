@@ -123,6 +123,69 @@ function snapBbox(minLat, minLon, maxLat, maxLon) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Cell-based Overpass fetch for /water, /buildings, /roads.
+//
+// BUG THIS FIXES: the old per-handler code cached by snapBbox(minLat,minLon)
+// — the CALLER's own bbox south-west corner floored to the cell grid. /water
+// happened to be safe because its Roblox-side caller (WaterMaskService.lua)
+// already pre-snaps its own bbox to this exact grid before sending. /roads
+// and /buildings callers (OsmService.lua, BuildingService.lua) do NOT —
+// they send an arbitrary ~400m-radius bbox centered on the exact teleport
+// point. Two different (but nearby) teleport locations whose small bboxes
+// happened to floor onto the SAME cell corner used to silently share one
+// cached response, serving the FIRST location's roads/buildings to the
+// SECOND real-world location.
+//
+// FIX: snap+widen to the FULL cell(s) the requested bbox actually touches
+// (usually one, occasionally more if straddling a cell boundary), fetch/
+// cache each cell independently by its own canonical corner, and merge
+// (de-duplicating elements by type+id, since a way spanning two cells can
+// come back from both). This is correct regardless of whether a caller
+// pre-snaps its own bbox — /water keeps working identically (its caller's
+// bbox already IS exactly one cell, so cellsTouched always returns exactly
+// that one cell) while /roads and /buildings become safe too.
+// ─────────────────────────────────────────────────────────────────────────────
+function cellsTouched(minLat, minLon, maxLat, maxLon) {
+    const cells = [];
+    const latStart = Math.floor(minLat / CELL_DEG);
+    const latEnd   = Math.floor(maxLat / CELL_DEG);
+    const lonStart = Math.floor(minLon / CELL_DEG);
+    const lonEnd   = Math.floor(maxLon / CELL_DEG);
+    for (let cy = latStart; cy <= latEnd; cy++) {
+        for (let cx = lonStart; cx <= lonEnd; cx++) {
+            cells.push({ sLat: cy * CELL_DEG, sLon: cx * CELL_DEG });
+        }
+    }
+    return cells;
+}
+
+async function fetchCellsMerged(minLat, minLon, maxLat, maxLon, cachePrefix, queryForCell) {
+    const cells = cellsTouched(minLat, minLon, maxLat, maxLon);
+    const seen   = new Set();
+    const merged = [];
+
+    await Promise.all(cells.map(async ({ sLat, sLon }) => {
+        const cacheKey = `${cachePrefix}|${sLat.toFixed(2)},${sLon.toFixed(2)}`;
+        let result = osmCache.get(cacheKey);
+        if (!result) {
+            const cQuery = queryForCell(sLat, sLon, sLat + CELL_DEG, sLon + CELL_DEG);
+            const data = await postOverpass(cQuery);
+            result = { elements: data.elements || [] };
+            osmCacheSet(cacheKey, result);
+        }
+        for (const el of result.elements) {
+            const dedupeKey = `${el.type}/${el.id}`;
+            if (!seen.has(dedupeKey)) {
+                seen.add(dedupeKey);
+                merged.push(el);
+            }
+        }
+    }));
+
+    return { elements: merged };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Overpass request queue  — Webshare agent rotated per call/retry
 // ─────────────────────────────────────────────────────────────────────────────
 const MIN_OVERPASS_GAP_MS  = 1100;
@@ -335,15 +398,9 @@ app.post("/water", async (req, res) => {
     const bbox = parseBbox(req.body);
     if (bbox.error) return res.status(400).json({ error: bbox.error });
     const { minLat, minLon, maxLat, maxLon } = bbox;
-    const { sLat, sLon } = snapBbox(minLat, minLon, maxLat, maxLon);
-    const cacheKey = `water|${sLat.toFixed(2)},${sLon.toFixed(2)}`;
-    if (osmCache.has(cacheKey)) return res.json(osmCache.get(cacheKey));
-
-    const query = `[out:json][timeout:25];(way["natural"="water"](${minLat},${minLon},${maxLat},${maxLon});way["waterway"="riverbank"](${minLat},${minLon},${maxLat},${maxLon});way["natural"="beach"](${minLat},${minLon},${maxLat},${maxLon}););out body;>;out skel qt;`;
     try {
-        const data = await postOverpass(query);
-        const result = { elements: data.elements||[] };
-        osmCacheSet(cacheKey, result);
+        const result = await fetchCellsMerged(minLat, minLon, maxLat, maxLon, "water",
+            (a, b, c, d) => `[out:json][timeout:25];(way["natural"="water"](${a},${b},${c},${d});way["waterway"="riverbank"](${a},${b},${c},${d});way["natural"="beach"](${a},${b},${c},${d}););out body;>;out skel qt;`);
         res.json(result);
     } catch (err) {
         console.error("[Proxy] /water Overpass failed:", err.message);
@@ -358,15 +415,9 @@ app.post("/buildings", async (req, res) => {
     const bbox = parseBbox(req.body);
     if (bbox.error) return res.status(400).json({ error: bbox.error });
     const { minLat, minLon, maxLat, maxLon } = bbox;
-    const { sLat, sLon } = snapBbox(minLat, minLon, maxLat, maxLon);
-    const cacheKey = `buildings|${sLat.toFixed(2)},${sLon.toFixed(2)}`;
-    if (osmCache.has(cacheKey)) return res.json(osmCache.get(cacheKey));
-
-    const query = `[out:json][timeout:25];(way["building"](${minLat},${minLon},${maxLat},${maxLon}););out body;>;out skel qt;`;
     try {
-        const data = await postOverpass(query);
-        const result = { elements: data.elements||[] };
-        osmCacheSet(cacheKey, result);
+        const result = await fetchCellsMerged(minLat, minLon, maxLat, maxLon, "buildings",
+            (a, b, c, d) => `[out:json][timeout:25];(way["building"](${a},${b},${c},${d}););out body;>;out skel qt;`);
         res.json(result);
     } catch (err) {
         console.error("[Proxy] /buildings Overpass failed:", err.message);
@@ -414,25 +465,23 @@ app.post("/roads", async (req, res) => {
     const bbox = parseBbox(req.body);
     if (bbox.error) return res.status(400).json({ error: bbox.error });
     const { minLat, minLon, maxLat, maxLon } = bbox;
-    const { sLat, sLon } = snapBbox(minLat, minLon, maxLat, maxLon);
-    const cacheKey = `roads|${sLat.toFixed(2)},${sLon.toFixed(2)}`;
-    if (osmCache.has(cacheKey)) return res.json(osmCache.get(cacheKey));
-
-    const query = `[out:json][timeout:25];(way["highway"~"^(${ROAD_FILTER})$"](${minLat},${minLon},${maxLat},${maxLon}););out body;>;out skel qt;`;
     try {
-        const data = await postOverpass(query);
+        // Cache the raw per-cell Overpass elements (nodes+ways, pre-resolution)
+        // under their own prefix, then resolve ways->nodes once over the
+        // merged set — a way whose nodes fall in different cells still
+        // resolves fully as long as every cell it touches was fetched.
+        const merged = await fetchCellsMerged(minLat, minLon, maxLat, maxLon, "roads-raw",
+            (a, b, c, d) => `[out:json][timeout:25];(way["highway"~"^(${ROAD_FILTER})$"](${a},${b},${c},${d}););out body;>;out skel qt;`);
         const nodes={};
-        for (const el of (data.elements||[])) { if (el.type==="node") nodes[el.id]={lat:el.lat,lon:el.lon}; }
+        for (const el of merged.elements) { if (el.type==="node") nodes[el.id]={lat:el.lat,lon:el.lon}; }
         const ways=[];
-        for (const el of (data.elements||[])) {
+        for (const el of merged.elements) {
             if (el.type==="way"&&el.nodes) {
                 const resolved=el.nodes.map(id=>nodes[id]).filter(Boolean);
                 if (resolved.length>=2) ways.push({id:el.id,tags:el.tags||{},nodes:resolved});
             }
         }
-        const result = { ways };
-        osmCacheSet(cacheKey, result);
-        res.json(result);
+        res.json({ ways });
     } catch (err) {
         console.error("[Proxy] /roads Overpass failed:", err.message);
         res.status(err.response?.status||500).json({ error: "Failed to fetch road data", detail: err.message });
@@ -483,8 +532,23 @@ function loadKoppen() {
 }
 loadKoppen();
 
+// Normalizes any longitude to (-180, 180]. koppenNearest walks a ring of
+// samples out from the query point (lon+dx*d for dx up to ±maxRing) — near
+// the antimeridian that ring crosses ±180 and used to land far outside the
+// raster's px range (0..width), returning null for every ring cell even
+// though the wrapped-around longitude has real data. This silently produced
+// "NONE" climate/biome classification for a band of columns straddling
+// 180°/-180° longitude (e.g. Fiji, eastern Siberia, the Aleutians).
+function wrapLon(lon) {
+    let w = lon % 360;
+    if (w > 180) w -= 360;
+    else if (w <= -180) w += 360;
+    return w;
+}
+
 function koppenAt(lat,lon) {
     if (!koppen) return null;
+    lon = wrapLon(lon);
     const px=Math.floor((lon-koppen.originLon)/koppen.deg);
     const py=Math.floor((koppen.originLat-lat)/koppen.deg);
     if (px<0||py<0||px>=koppen.width||py>=koppen.height) return null;
@@ -815,9 +879,48 @@ async function fetchAntarctica(bbox) {
     return fetchWcsTile("https://overlord.pgc.umn.edu/arcgis/rest/services/elevation/pgc_rema_mosaics_v2/ImageServer/WCSServer","1",bbox,0.0000180,0.0000180);
 }
 
+// Rest-of-world named peaks (Aconcagua, Kilimanjaro, Elbrus, Puncak Jaya,
+// Mont Blanc) — Copernicus DEM GLO-30 via the public AWS Open Data bucket
+// (registry.opendata.aws/copernicus-dem). Verified real: bucket
+// "copernicus-dem-30m", eu-central-1, public HTTPS GET, no API key, no
+// rate limit — deliberately NOT using OpenTopography's /API/globaldem
+// convenience wrapper for the same dataset, which requires a key and caps
+// non-academic use at 50 calls/24h, unworkable for a live game server.
+//
+// Tiles are fixed 1x1 degree COGs named by their SW corner (e.g.
+// Copernicus_DSM_COG_10_N27_00_E086_00_DEM). A tile (~111km across) is
+// always much larger than the caller's zoom-13 bbox (~20-40km), so unlike
+// fetchJapan's original bug (a SMALLER native tile than the requested
+// bbox, causing samples to silently land on the wrong side of real
+// terrain), the only residual edge case here is a requested bbox that
+// straddles a whole-degree line — samples past this tile's real edge get
+// clamped by resampleToPixels/sampleBilinear to that edge's value instead
+// of reading real terrain from the neighboring tile. That is a far milder
+// failure (a few repeated-edge pixels once every ~111km) than what Japan
+// produced, but it is a known v1 limitation, not a solved one.
+//
+// Still returns bbox = the TILE'S OWN real 1x1 degree extent, never the
+// caller's requested bbox — the one fix that actually mattered for Japan,
+// applied here from the start instead of after the fact.
+async function fetchCopernicusGlo30(bbox) {
+    const {west,east,north,south}=bbox;
+    const midLat=(north+south)/2, midLon=(east+west)/2;
+    const tileLat=Math.floor(midLat), tileLon=Math.floor(midLon);
+    const ns=tileLat>=0?"N":"S", ew=tileLon>=0?"E":"W";
+    const latAbs=String(Math.abs(tileLat)).padStart(2,"0");
+    const lonAbs=String(Math.abs(tileLon)).padStart(3,"0");
+    const name=`Copernicus_DSM_COG_10_${ns}${latAbs}_00_${ew}${lonAbs}_00_DEM`;
+    const url=`https://copernicus-dem-30m.s3.amazonaws.com/${name}/${name}.tif`;
+    const response=await axios.get(url,{responseType:"arraybuffer",timeout:15000,headers:{"User-Agent":"Tellus-Roblox-Proxy/3.5"}});
+    const decoded=await decodeGeoTiff(Buffer.from(response.data));
+    decoded.bbox={west:tileLon,east:tileLon+1,north:tileLat+1,south:tileLat};
+    return decoded;
+}
+
 // ── Regional routes ───────────────────────────────────────────────────────────
 app.post("/elevation/arctic",      (req,res)=>handleRegionalElevation(req,res,fetchArctic));
 app.post("/elevation/antarctica",  (req,res)=>handleRegionalElevation(req,res,fetchAntarctica));
+app.post("/elevation/glo30",       (req,res)=>handleRegionalElevation(req,res,fetchCopernicusGlo30));
 app.post("/elevation/ch",  (req,res)=>handleRegionalElevation(req,res,fetchSwiss));
 app.post("/elevation/no",  (req,res)=>handleRegionalElevation(req,res,fetchNorway));
 app.post("/elevation/nl",  (req,res)=>handleRegionalElevation(req,res,fetchNetherlands));
@@ -867,6 +970,7 @@ app.get("/",(req,res)=>{
             "POST /elevation              -> batched pixel samples (global Terrarium)",
             "POST /elevation/arctic       -> ArcticDEM v4.1 via PGC ArcGIS WCS",
             "POST /elevation/antarctica   -> REMA v2 via PGC ArcGIS WCS",
+            "POST /elevation/glo30        -> Copernicus DEM GLO-30 (rest-of-world named peaks)",
             "POST /elevation/ch           -> SwissTopo ALTI3D 0.5m",
             "POST /elevation/no           -> Kartverket DTM1 1m",
             "POST /elevation/nl           -> PDOK AHN4 0.5m",
