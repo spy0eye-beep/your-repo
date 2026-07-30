@@ -585,6 +585,31 @@ app.get("/geocode", async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// GET /reverse?lat=&lon=  — reverse geocode (used by PassportService for
+// country-of-current-location, and the landing title card)
+// ─────────────────────────────────────────────────────────────────────────────
+app.get("/reverse", async (req, res) => {
+    const lat = Number(req.query.lat);
+    const lon = Number(req.query.lon);
+    if (!Number.isFinite(lat) || !Number.isFinite(lon) || lat < -90 || lat > 90 || lon < -180 || lon > 180) {
+        return res.status(400).json({ error: "lat/lon must be numbers in valid range" });
+    }
+    try {
+        // zoom=3 is Nominatim's "country" level of detail — this endpoint's
+        // only real consumer wants a country name, not a street address, so
+        // asking for less detail also means a smaller/faster response.
+        const url=`https://nominatim.openstreetmap.org/reverse?format=json&zoom=3&lat=${encodeURIComponent(lat)}&lon=${encodeURIComponent(lon)}`;
+        const response=await axios.get(url,{headers:{"User-Agent":"Tellus-Roblox-Proxy/3.5"}});
+        const data = response.data || {};
+        const country = data.address && data.address.country;
+        res.json({ country: country || null, displayName: data.display_name || null });
+    } catch(err) {
+        console.error("[Proxy] /reverse failed:",err.message);
+        res.status(500).json({error:"Reverse geocode fetch failed"});
+    }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Köppen–Geiger climate raster
 // ─────────────────────────────────────────────────────────────────────────────
 const KOPPEN_CODES = [
@@ -1075,6 +1100,7 @@ app.get("/",(req,res)=>{
             "POST /roads                  -> road ways (cached)",
             "POST /osm                    -> roads + buildings combined (cached)",
             "GET  /geocode?q=             -> Nominatim search",
+            "GET  /reverse?lat=&lon=      -> Nominatim reverse geocode (country)",
             "POST /landcover              -> Koppen climate per point",
         ],
         removedSources:[
