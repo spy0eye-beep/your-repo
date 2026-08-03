@@ -501,8 +501,29 @@ app.post("/water", async (req, res) => {
     if (bbox.error) return res.status(400).json({ error: bbox.error });
     const { minLat, minLon, maxLat, maxLon } = bbox;
     try {
-        const result = await fetchCellsMerged(minLat, minLon, maxLat, maxLon, "water",
-            (a, b, c, d) => `[out:json][timeout:25];(way["natural"="water"](${a},${b},${c},${d});way["waterway"="riverbank"](${a},${b},${c},${d});way["natural"="beach"](${a},${b},${c},${d}););out body;>;out skel qt;`);
+        // v12: added natural=coastline and waterway centerlines.
+        //
+        //  • natural=coastline — OSM's authoritative land/sea boundary, as a
+        //    DIRECTED linestring (land is always on the LEFT of the way
+        //    direction). WaterMaskService uses a side-of-line test for it, NOT
+        //    point-in-polygon (coastlines are open ways, so PIP returns
+        //    garbage — that's why this tag was removed from here originally).
+        //    It's applied only as a near-shore refinement, giving a crisp
+        //    vector coast instead of the 10 m-quantised landcover stair-step.
+        //
+        //  • waterway river/stream/canal — the river CENTERLINES. The Roblox
+        //    side (WaterMaskService.DEFAULT_HALF_WIDTH_M / isLine /
+        //    distanceToPolylineMeters) has always known how to buffer these
+        //    into real channels, but this query never actually asked for them,
+        //    so rivers silently never existed. `drain` is deliberately left
+        //    out — they're tiny and extremely numerous, and would balloon the
+        //    payload for almost no visual gain.
+        //
+        // Cache prefix bumped to "water2" so any in-memory cell cached under
+        // the OLD (coastline-less, river-less) query can't be served after
+        // this deploy.
+        const result = await fetchCellsMerged(minLat, minLon, maxLat, maxLon, "water2",
+            (a, b, c, d) => `[out:json][timeout:25];(way["natural"="water"](${a},${b},${c},${d});way["waterway"="riverbank"](${a},${b},${c},${d});way["natural"="beach"](${a},${b},${c},${d});way["natural"="coastline"](${a},${b},${c},${d});way["waterway"~"^(river|stream|canal)$"](${a},${b},${c},${d}););out body;>;out skel qt;`);
         res.json(result);
     } catch (err) {
         console.error("[Proxy] /water Overpass failed:", err.message);
