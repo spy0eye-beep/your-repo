@@ -92,6 +92,31 @@ function terrariumToMeters(r, g, b) {
     return (r * 256 + g + b / 256) - 32768;
 }
 
+// Terrarium carries real OCEAN BATHYMETRY (signed metres below sea level).
+// Fine at low zoom where it averages out, but the DEM zoom bump to 15 exposes
+// per-pixel abyssal values right at the shoreline — e.g. the Taghazout coast
+// tile drops to -2966 m ONE pixel from +70 m land (a continental slope that
+// Terrarium's coarse bathymetry renders as a 3 km cliff at z15). Two artifacts
+// followed: (1) values between ~-300 and -2000 m PASS repairTileVoids' 2000 m
+// threshold and reach the engine as a literal chasm ("deep hole" at the beach);
+// (2) values past -2000 m get mistaken for voids and flood-filled with the
+// nearest LAND height, raising a patch of seabed into a land spire out of the
+// water. This game renders oceans as surface water at sea level, so true
+// abyssal depth is never experienced — only the artifacts are. Flooring
+// bathymetry to a shallow, bounded sea floor keeps oceans readable as water,
+// makes coastlines realistic-cliff-scale instead of chasms, AND stops the void
+// repair from ever seeing ocean as corruption (so no more land spikes). The
+// +9000 m cap (above Everest's 8849 m) is cheap defence against a positive
+// spike too. Applied BEFORE repairTileVoids so genuine LAND corruption (still a
+// huge outlier vs a land tile's median) keeps getting caught and filled.
+const SEA_FLOOR_CLAMP_M = -50;   // deepest we let the ocean render (still dive-able)
+const PEAK_CLAMP_M      = 9000;  // just above the highest real land on Earth
+function clampBathymetry(m) {
+    if (!(m > SEA_FLOOR_CLAMP_M)) return SEA_FLOOR_CLAMP_M; // also maps NaN -> floor
+    if (m > PEAK_CLAMP_M) return PEAK_CLAMP_M;
+    return m;
+}
+
 // Terrarium's OWN published tiles occasionally bake in corrupted/void
 // regions — confirmed by decoding tile 13/4096/4096 (real-world (0,0),
 // the default player spawn area) directly: the leftmost 4 of 256 columns
@@ -383,7 +408,7 @@ async function fetchTile(z, x, y) {
     for (let row = 0; row < height; row++) {
         for (let col = 0; col < width; col++) {
             const idx = (row * width + col) * channels;
-            elevations[row * width + col] = terrariumToMeters(data[idx], data[idx+1], data[idx+2]);
+            elevations[row * width + col] = clampBathymetry(terrariumToMeters(data[idx], data[idx+1], data[idx+2]));
         }
     }
     repairTileVoids(elevations, width, height);
