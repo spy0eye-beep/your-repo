@@ -677,16 +677,126 @@ function koppenNearest(lat,lon,maxRing) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /landcover
+//
+// REAL per-pixel land cover from Esri's Sentinel-2 10 m Land Use/Land Cover
+// (Impact Observatory io-lulc, a 2017-2025 yearly time series). This route used
+// to hardcode esa:0 for every point — so the engine had NO per-pixel cover and
+// fell back to a climate-only guess, which over-greened deserts (Taghazout read
+// as "savanna", the Sahara as wooded). We now sample the ImageServer's
+// getSamples op — the only op on this service that returns a class value per
+// lat/lon (identify + a `where`/`time` filter both reject the [Year] time field;
+// getSamples with a mosaicRule locked to one raster is what works). The io-lulc
+// classes are remapped to the ESA WorldCover codes BiomeClassification already
+// keys on, so nothing downstream changes. Köppen is still returned alongside —
+// the engine uses it whenever esa is 0 (clouds / nodata / ocean / fetch failure).
 // ─────────────────────────────────────────────────────────────────────────────
-app.post("/landcover",(req,res)=>{
-    const points=(req.body&&req.body.points)||[];
-    if (!Array.isArray(points)||points.length===0) return res.json({classes:[]});
-    const classes=points.map(p=>{
-        const lat=Number(p.lat),lon=Number(p.lon);
-        if (!isFinite(lat)||!isFinite(lon)) return {esa:0,koppen:"NONE"};
-        return {esa:0,koppen:koppenNearest(lat,lon,3)||"NONE"};
+const LULC_URL = "https://ic.imagery1.arcgis.com/arcgis/rest/services/Sentinel2_10m_LandCover/ImageServer/getSamples";
+// OBJECTID of the raster to sample. On this service OID 7 == year 2023, a
+// complete global layer. (OID 9/2025 is incomplete → "Unable to complete
+// operation"; a `where Year=` filter is rejected by the service, so we lock by
+// raster id.) Override with LULC_RASTER_ID if Esri re-indexes the time series.
+const LULC_RASTER_ID   = Number(process.env.LULC_RASTER_ID || 7);
+const LULC_MOSAIC_RULE = JSON.stringify({ mosaicMethod: "esriMosaicLockRaster", lockRasterIds: [LULC_RASTER_ID] });
+const LULC_BATCH       = 100;   // points per getSamples call; batches run in parallel
+
+// Impact Observatory io-lulc class -> ESA WorldCover code the engine understands.
+//   io : 1 Water 2 Trees 4 FloodedVeg 5 Crops 7 Built 8 Bare 9 Snow/Ice 10 Clouds 11 Rangeland
+//   esa: 10 tree 20 shrub 30 grass 40 crop 50 built 60 bare 70 snow 80 water 90 wetland 95 mangrove 100 moss
+// Clouds (10) -> 0 so the engine falls through to köppen. Water (80) matches the
+// engine's own documented water convention (see ElevationService.getLandCover).
+const IO_TO_ESA = { 1: 80, 2: 10, 4: 90, 5: 40, 7: 50, 8: 60, 9: 70, 10: 0, 11: 30 };
+
+// LULC is static per year — cache hard by ~11 m (4-decimal) lat/lon key.
+const landcoverCache     = new Map();
+const LANDCOVER_CACHE_MAX = 20000;
+function lcKey(lat, lon) { return lat.toFixed(4) + "," + lon.toFixed(4); }
+function lcCacheSet(key, val) {
+    if (landcoverCache.size >= LANDCOVER_CACHE_MAX) landcoverCache.delete(landcoverCache.keys().next().value);
+    landcoverCache.set(key, val);
+}
+
+// Sample Esri LULC for a batch of {lat,lon}. Returns Map<batchIndex, esaCode> on
+// success (absent indices = ocean/nodata, which the caller records as esa 0), or
+// null on ANY failure so the caller degrades to köppen-only without poisoning
+// the cache with a bogus 0.
+async function fetchEsriLulc(points) {
+    if (points.length === 0) return new Map();
+    const geometry = JSON.stringify({
+        points: points.map(p => [p.lon, p.lat]),   // Esri wants [x=lon, y=lat]
+        spatialReference: { wkid: 4326 },
     });
-    res.json({classes});
+    const body = new URLSearchParams({
+        geometry,
+        geometryType: "esriGeometryMultipoint",
+        mosaicRule: LULC_MOSAIC_RULE,
+        returnFirstValueOnly: "false",
+        f: "json",
+    });
+    try {
+        const resp = await axios.post(LULC_URL, body.toString(), {
+            headers: { "Content-Type": "application/x-www-form-urlencoded" },
+            timeout: 12000,
+        });
+        const samples = resp.data && resp.data.samples;
+        if (!Array.isArray(samples)) return null;   // Esri error object, not a result set
+        const out = new Map();
+        for (const s of samples) {
+            const id = Number(s.locationId);
+            const io = parseInt(s.value, 10);
+            if (!isFinite(id) || !isFinite(io)) continue;
+            const esa = IO_TO_ESA[io];
+            if (esa !== undefined) out.set(id, esa);
+        }
+        return out;
+    } catch (err) {
+        console.warn("[landcover] Esri getSamples failed:", err.message);
+        return null;
+    }
+}
+
+app.post("/landcover", async (req, res) => {
+    const points = (req.body && req.body.points) || [];
+    if (!Array.isArray(points) || points.length === 0) return res.json({ classes: [] });
+
+    // 1. köppen for every point (fast, local) + seed esa from the cache.
+    const classes = points.map(p => {
+        const lat = Number(p.lat), lon = Number(p.lon);
+        if (!isFinite(lat) || !isFinite(lon)) return { esa: 0, koppen: "NONE", _skip: true };
+        const koppen = koppenNearest(lat, lon, 3) || "NONE";
+        const cached = landcoverCache.get(lcKey(lat, lon));
+        return {
+            esa: cached !== undefined ? cached : 0,
+            koppen, _lat: lat, _lon: lon, _cached: cached !== undefined,
+        };
+    });
+
+    // 2. Fetch real esa for the uncached, valid points — batched and parallel.
+    const need = [];
+    for (let i = 0; i < classes.length; i++) {
+        if (!classes[i]._skip && !classes[i]._cached) need.push(i);
+    }
+    if (need.length > 0) {
+        const batches = [];
+        for (let b = 0; b < need.length; b += LULC_BATCH) {
+            const idxs = need.slice(b, b + LULC_BATCH);
+            const pts  = idxs.map(i => ({ lat: classes[i]._lat, lon: classes[i]._lon }));
+            batches.push({ idxs, promise: fetchEsriLulc(pts) });
+        }
+        const results = await Promise.all(batches.map(b => b.promise));
+        for (let bi = 0; bi < batches.length; bi++) {
+            const got = results[bi];
+            if (got === null) continue;   // errored batch → köppen-only, don't cache
+            const idxs = batches[bi].idxs;
+            for (let j = 0; j < idxs.length; j++) {
+                const gi  = idxs[j];
+                const esa = got.has(j) ? got.get(j) : 0;   // absent = ocean/nodata
+                classes[gi].esa = esa;
+                lcCacheSet(lcKey(classes[gi]._lat, classes[gi]._lon), esa);
+            }
+        }
+    }
+
+    res.json({ classes: classes.map(c => ({ esa: c.esa, koppen: c.koppen })) });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
