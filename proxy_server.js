@@ -611,13 +611,18 @@ app.post("/water", async (req, res) => {
     if (bbox.error) return res.status(400).json({ error: bbox.error });
     const { minLat, minLon, maxLat, maxLon } = bbox;
     try {
-        // REVERTED to the pre-coastline/river query. The coastline vector +
-        // river centrelines were producing visual regressions in-engine
-        // (washed-out shallow coasts, sandy river-bed strips) that couldn't be
-        // resolved without live testing, so the whole water-shape feature was
-        // rolled back. Cache prefix returns to "water" too.
-        const result = await fetchCellsMerged(minLat, minLon, maxLat, maxLon, "water",
-            (a, b, c, d) => `[out:json][timeout:25];(way["natural"="water"](${a},${b},${c},${d});way["waterway"="riverbank"](${a},${b},${c},${d});way["natural"="beach"](${a},${b},${c},${d}););out body;>;out skel qt;`);
+        // Water POLYGONS (natural=water / riverbank / beach) PLUS the
+        // natural=coastline VECTOR. WaterMaskService needs the coastline ways to
+        // draw the ocean edge from the real shoreline instead of thresholding
+        // coarse elevation at sea level — the latter produces the blocky,
+        // chunk-quantised "vertical-stripe coastline" the [GridDbg] maps showed
+        // at flat coasts (Agadir). Coastlines are open linestrings, evaluated by
+        // coastlineSide() (a directed side-of-way test), never point-in-polygon.
+        // `>;out skel qt;` already pulls every referenced node, so coastline
+        // geometry resolves the same as the polygon ways. Cache prefix bumped to
+        // "water2" so pre-coastline cached responses are re-fetched.
+        const result = await fetchCellsMerged(minLat, minLon, maxLat, maxLon, "water2",
+            (a, b, c, d) => `[out:json][timeout:25];(way["natural"="water"](${a},${b},${c},${d});way["waterway"="riverbank"](${a},${b},${c},${d});way["natural"="beach"](${a},${b},${c},${d});way["natural"="coastline"](${a},${b},${c},${d}););out body;>;out skel qt;`);
         res.json(result);
     } catch (err) {
         console.error("[Proxy] /water Overpass failed:", err.message);
