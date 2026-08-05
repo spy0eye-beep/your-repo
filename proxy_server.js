@@ -387,11 +387,99 @@ function parseBbox(body) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Fetch + decode a Terrarium elevation tile (cached)
+// Mapterhorn elevation (v13) — the curated global DEM the Minecraft mod uses.
+// Same Terrarium encoding, but WebP, 512 px tiles, and MUCH cleaner data: it has
+// none of Terrarium's coastal artifacts (verified: the Guanabara Bay/Rio +20 m
+// phantom that terraced the whole coast reads a correct 0 m here). It is
+// land-only (deep ocean returns 0 m / no bathymetry), which is fine — that noisy
+// bathymetry was the source of every chasm; a synthesized ocean floor replaces
+// it. Max zoom is coverage-dependent (~12–14); z12 (512 px) is globally present,
+// so we source from z12 and resample into the z/x/y/256 grid the rest of the
+// proxy already expects. Anywhere Mapterhorn 404s, fetchTile falls back to
+// Terrarium wholesale — so this can never render worse than before.
+// ─────────────────────────────────────────────────────────────────────────────
+const MAPTERHORN_ENDPOINT = "https://tiles.mapterhorn.com";
+const MAPTERHORN_ZOOM     = 12;   // universal coverage zoom (512 px tiles)
+const mhTileCache         = new Map();
+const MH_TILE_CACHE_MAX   = 128;
+
+async function fetchMapterhornTile(z, x, y) {
+    const key = `${z}/${x}/${y}`;
+    if (mhTileCache.has(key)) return mhTileCache.get(key);
+    let out = null;
+    try {
+        const resp = await axios.get(`${MAPTERHORN_ENDPOINT}/${z}/${x}/${y}.webp`, {
+            responseType: "arraybuffer", timeout: 10000,
+            headers: { "User-Agent": "Tellus-Roblox-Proxy/4 (+mapterhorn)" },
+        });
+        const { data, info } = await sharp(Buffer.from(resp.data))
+            .ensureAlpha(0).raw().toBuffer({ resolveWithObject: true });
+        const { width, height, channels } = info;
+        const elev = new Float32Array(width * height);
+        for (let i = 0; i < width * height; i++) {
+            const o = i * channels;
+            elev[i] = clampBathymetry(terrariumToMeters(data[o], data[o + 1], data[o + 2]));
+        }
+        out = { width, height, elevations: elev };
+    } catch (err) {
+        out = null; // 404 (no coverage) or decode issue → caller uses Terrarium
+    }
+    if (mhTileCache.size >= MH_TILE_CACHE_MAX) mhTileCache.delete(mhTileCache.keys().next().value);
+    mhTileCache.set(key, out);
+    return out;
+}
+
+// Build the 256×256 elevation grid for tile z/x/y from Mapterhorn's 512 px
+// z≤12 tiles. Returns null unless Mapterhorn covers the WHOLE tile (so we never
+// stitch a half-Mapterhorn/half-Terrarium seam). Web-Mercator is linear, so the
+// output→Mapterhorn pixel map is a single scale factor — no per-pixel trig.
+async function buildTileFromMapterhorn(z, x, y) {
+    const MZ = Math.min(z, MAPTERHORN_ZOOM);
+    const OUT = 256;
+    const scale = (Math.pow(2, MZ) * 512) / (Math.pow(2, z) * OUT); // MH px per output px
+    const baseX = x * OUT, baseY = y * OUT;
+
+    // A z15 tile is 1/8 of a z12 tile, so it touches at most a 2×2 block of them.
+    const need = new Map();
+    for (const [c, r] of [[0, 0], [OUT - 1, 0], [0, OUT - 1], [OUT - 1, OUT - 1]]) {
+        const tx = Math.floor(((baseX + c) * scale) / 512);
+        const ty = Math.floor(((baseY + r) * scale) / 512);
+        need.set(`${tx}/${ty}`, { tx, ty, tile: null });
+    }
+    await Promise.all([...need.values()].map(async (e) => { e.tile = await fetchMapterhornTile(MZ, e.tx, e.ty); }));
+    for (const e of need.values()) if (!e.tile) return null; // any gap → Terrarium
+
+    const elevations = new Float32Array(OUT * OUT);
+    for (let row = 0; row < OUT; row++) {
+        const mgy = (baseY + row) * scale;
+        const ty = Math.floor(mgy / 512), ly = mgy - ty * 512;
+        for (let col = 0; col < OUT; col++) {
+            const mgx = (baseX + col) * scale;
+            const tx = Math.floor(mgx / 512), lx = mgx - tx * 512;
+            const t = need.get(`${tx}/${ty}`).tile;
+            const px = Math.min(t.width - 1, Math.max(0, Math.round(lx)));
+            const py = Math.min(t.height - 1, Math.max(0, Math.round(ly)));
+            elevations[row * OUT + col] = t.elevations[py * t.width + px];
+        }
+    }
+    return { width: OUT, height: OUT, elevations };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Fetch + decode an elevation tile (cached). Mapterhorn first, Terrarium fallback.
 // ─────────────────────────────────────────────────────────────────────────────
 async function fetchTile(z, x, y) {
     const key = `${z}/${x}/${y}`;
     if (tileCache.has(key)) return tileCache.get(key);
+
+    // Prefer Mapterhorn (clean, artifact-free). Whole-tile fallback to Terrarium
+    // where it has no coverage keeps sources from ever mixing within one tile.
+    try {
+        const mh = await buildTileFromMapterhorn(z, x, y);
+        if (mh) { tileCacheSet(key, mh); return mh; }
+    } catch (err) {
+        console.warn("[elevation] Mapterhorn build failed, using Terrarium:", err.message);
+    }
 
     const url = `https://s3.amazonaws.com/elevation-tiles-prod/terrarium/${z}/${x}/${y}.png`;
     const response = await axios.get(url, {
@@ -501,29 +589,13 @@ app.post("/water", async (req, res) => {
     if (bbox.error) return res.status(400).json({ error: bbox.error });
     const { minLat, minLon, maxLat, maxLon } = bbox;
     try {
-        // v12: added natural=coastline and waterway centerlines.
-        //
-        //  • natural=coastline — OSM's authoritative land/sea boundary, as a
-        //    DIRECTED linestring (land is always on the LEFT of the way
-        //    direction). WaterMaskService uses a side-of-line test for it, NOT
-        //    point-in-polygon (coastlines are open ways, so PIP returns
-        //    garbage — that's why this tag was removed from here originally).
-        //    It's applied only as a near-shore refinement, giving a crisp
-        //    vector coast instead of the 10 m-quantised landcover stair-step.
-        //
-        //  • waterway river/stream/canal — the river CENTERLINES. The Roblox
-        //    side (WaterMaskService.DEFAULT_HALF_WIDTH_M / isLine /
-        //    distanceToPolylineMeters) has always known how to buffer these
-        //    into real channels, but this query never actually asked for them,
-        //    so rivers silently never existed. `drain` is deliberately left
-        //    out — they're tiny and extremely numerous, and would balloon the
-        //    payload for almost no visual gain.
-        //
-        // Cache prefix bumped to "water2" so any in-memory cell cached under
-        // the OLD (coastline-less, river-less) query can't be served after
-        // this deploy.
-        const result = await fetchCellsMerged(minLat, minLon, maxLat, maxLon, "water2",
-            (a, b, c, d) => `[out:json][timeout:25];(way["natural"="water"](${a},${b},${c},${d});way["waterway"="riverbank"](${a},${b},${c},${d});way["natural"="beach"](${a},${b},${c},${d});way["natural"="coastline"](${a},${b},${c},${d});way["waterway"~"^(river|stream|canal)$"](${a},${b},${c},${d}););out body;>;out skel qt;`);
+        // REVERTED to the pre-coastline/river query. The coastline vector +
+        // river centrelines were producing visual regressions in-engine
+        // (washed-out shallow coasts, sandy river-bed strips) that couldn't be
+        // resolved without live testing, so the whole water-shape feature was
+        // rolled back. Cache prefix returns to "water" too.
+        const result = await fetchCellsMerged(minLat, minLon, maxLat, maxLon, "water",
+            (a, b, c, d) => `[out:json][timeout:25];(way["natural"="water"](${a},${b},${c},${d});way["waterway"="riverbank"](${a},${b},${c},${d});way["natural"="beach"](${a},${b},${c},${d}););out body;>;out skel qt;`);
         res.json(result);
     } catch (err) {
         console.error("[Proxy] /water Overpass failed:", err.message);
