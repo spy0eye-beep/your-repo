@@ -449,17 +449,39 @@ async function buildTileFromMapterhorn(z, x, y) {
     await Promise.all([...need.values()].map(async (e) => { e.tile = await fetchMapterhornTile(MZ, e.tx, e.ty); }));
     for (const e of need.values()) if (!e.tile) return null; // any gap → Terrarium
 
+    // Sample one Mapterhorn source pixel by GLOBAL pixel index, resolving which
+    // 512px tile it lives in (a z15 output tile can straddle 2×2 MH tiles, all
+    // in `need`). Returns null only if that tile wasn't fetched (defensive).
+    const sampleMH = (gx, gy) => {
+        const tx = Math.floor(gx / 512), ty = Math.floor(gy / 512);
+        const e = need.get(`${tx}/${ty}`);
+        if (!e || !e.tile) return null;
+        const t = e.tile;
+        const px = Math.min(t.width - 1, Math.max(0, gx - tx * 512));
+        const py = Math.min(t.height - 1, Math.max(0, gy - ty * 512));
+        return t.elevations[py * t.width + px];
+    };
+
+    // BILINEAR resample (was nearest-neighbor). At z15, scale≈0.25 means 64 real
+    // MH samples upsample to 256 output px: nearest duplicated each into a 4×4
+    // block → flat plateaus + hard risers (the terrace bug). Bilinear ramps
+    // smoothly between the 4 surrounding samples so every output cell varies
+    // continuously — no plateaus for the voxel staircase to bite on.
     const elevations = new Float32Array(OUT * OUT);
     for (let row = 0; row < OUT; row++) {
         const mgy = (baseY + row) * scale;
-        const ty = Math.floor(mgy / 512), ly = mgy - ty * 512;
+        const y0 = Math.floor(mgy), fy = mgy - y0;
         for (let col = 0; col < OUT; col++) {
             const mgx = (baseX + col) * scale;
-            const tx = Math.floor(mgx / 512), lx = mgx - tx * 512;
-            const t = need.get(`${tx}/${ty}`).tile;
-            const px = Math.min(t.width - 1, Math.max(0, Math.round(lx)));
-            const py = Math.min(t.height - 1, Math.max(0, Math.round(ly)));
-            elevations[row * OUT + col] = t.elevations[py * t.width + px];
+            const x0 = Math.floor(mgx), fx = mgx - x0;
+            const v00 = sampleMH(x0, y0);
+            if (v00 === null) return null; // center sample missing → whole-tile Terrarium
+            const v10 = sampleMH(x0 + 1, y0) ?? v00;
+            const v01 = sampleMH(x0, y0 + 1) ?? v00;
+            const v11 = sampleMH(x0 + 1, y0 + 1) ?? v10;
+            const top = v00 + (v10 - v00) * fx;
+            const bot = v01 + (v11 - v01) * fx;
+            elevations[row * OUT + col] = top + (bot - top) * fy;
         }
     }
     return { width: OUT, height: OUT, elevations };
