@@ -908,6 +908,107 @@ async function fetchEsriLulc(points) {
     }
 }
 
+// ── REAL 11-class land cover: ESA WorldCover 2021, 10 m ──────────────────────
+// io-lulc (above) has only ONE "Rangeland" class, so shrubland, grassland,
+// savanna, steppe, tundra and desert-scrub all collapse together — the Grand
+// Canyon rendered as green grass. ESA WorldCover 2021 has all 11 classes as
+// SEPARATE values, and crucially its raster values ARE the exact ESA codes the
+// engine already consumes (10 tree, 20 shrub, 30 grass, 40 crop, 50 built,
+// 60 bare, 70 snow, 80 water, 90 wetland, 95 mangrove, 100 moss) — so no
+// remapping at all. It's served as an Esri tiled ImageServer: LERC2-encoded U8
+// tiles on a WGS84 geographic grid (origin -180,84; level 13 = 10 m). One tile
+// spans ~2 km, so every point in a chunk falls in ONE tile → one fetch+decode
+// per chunk (cheaper than io-lulc's per-point getSamples). Falls back to io-lulc
+// (fetchEsriLulc) whenever a tile is unavailable, so this can only ADD accuracy.
+const WC_URL       = "https://tiledimageservices.arcgis.com/P3ePLMYs2RVChkJx/arcgis/rest/services/European_Space_Agency_WorldCover_2021_Land_Cover_WGS84_7/ImageServer";
+const WC_LEVEL     = 13;                          // max LOD = 10 m
+const WC_RES       = 0.682666666666667 / (2 ** WC_LEVEL); // deg/pixel at WC_LEVEL
+const WC_TILE_PX   = 256;
+const WC_ORIGIN_X  = -180, WC_ORIGIN_Y = 84;      // tile grid top-left (from tileInfo)
+const WC_VALID     = new Set([10, 20, 30, 40, 50, 60, 70, 80, 90, 95, 100]);
+
+let _lercReady = null;
+function lercReady() {
+    if (!_lercReady) {
+        const Lerc = require("lerc");
+        _lercReady = Lerc.load().then(() => Lerc);
+    }
+    return _lercReady;
+}
+
+// tileKey "col/row" -> Promise<{px,w,h,mask}|null>. Caches the decode promise so
+// concurrent chunk requests for the same tile dedupe; static data, cache hard.
+const wcTileCache      = new Map();
+const WC_TILE_CACHE_MAX = 500;
+function wcTileFetch(col, row) {
+    const key = col + "/" + row;
+    if (wcTileCache.has(key)) return wcTileCache.get(key);
+    const p = (async () => {
+        try {
+            const resp = await axios.get(`${WC_URL}/tile/${WC_LEVEL}/${row}/${col}`, {
+                responseType: "arraybuffer", timeout: 12000,
+            });
+            const buf = Buffer.from(resp.data);
+            // Nodata/ocean tiles come back as a 404 HTML page, not a LERC blob.
+            if (buf.length < 16 || buf.toString("latin1", 0, 5) !== "Lerc2") return null;
+            const Lerc = await lercReady();
+            const dec  = Lerc.decode(buf);
+            return { px: dec.pixels[0], w: dec.width, h: dec.height, mask: dec.maskData };
+        } catch (err) {
+            return null; // 404 nodata / network / decode failure → caller falls back
+        }
+    })();
+    if (wcTileCache.size >= WC_TILE_CACHE_MAX) wcTileCache.delete(wcTileCache.keys().next().value);
+    wcTileCache.set(key, p);
+    return p;
+}
+
+// Sample ESA WorldCover for a batch. Returns Map<index,esaCode> for resolved
+// points, or null if EVERY tile failed (→ caller uses io-lulc for the whole
+// batch). Points on a nodata/ocean tile are simply absent (caller treats as 0),
+// exactly like io-lulc's absent-sample convention.
+async function fetchEsaWorldCover(points) {
+    if (points.length === 0) return new Map();
+    const byTile = new Map(); // "col/row" -> { col, row, pts:[{i,px,py}] }
+    for (let i = 0; i < points.length; i++) {
+        const lat = Number(points[i].lat), lon = Number(points[i].lon);
+        if (!isFinite(lat) || !isFinite(lon)) continue;
+        const gx = (lon - WC_ORIGIN_X) / WC_RES;  // global pixel x (east +)
+        const gy = (WC_ORIGIN_Y - lat) / WC_RES;  // global pixel y (north-down)
+        const col = Math.floor(gx / WC_TILE_PX);
+        const row = Math.floor(gy / WC_TILE_PX);
+        const px  = Math.floor(gx) - col * WC_TILE_PX;
+        const py  = Math.floor(gy) - row * WC_TILE_PX;
+        const key = col + "/" + row;
+        if (!byTile.has(key)) byTile.set(key, { col, row, pts: [] });
+        byTile.get(key).pts.push({ i, px, py });
+    }
+    const out = new Map();
+    let anyTileOk = false;
+    await Promise.all([...byTile.values()].map(async t => {
+        const tile = await wcTileFetch(t.col, t.row);
+        if (!tile) return;
+        anyTileOk = true;
+        for (const { i, px, py } of t.pts) {
+            const cx = Math.min(Math.max(px, 0), tile.w - 1);
+            const cy = Math.min(Math.max(py, 0), tile.h - 1);
+            const idx = cy * tile.w + cx;
+            if (tile.mask && tile.mask[idx] === 0) continue; // masked = nodata
+            const v = tile.px[idx];
+            if (WC_VALID.has(v)) out.set(i, v);
+        }
+    }));
+    return anyTileOk ? out : null;
+}
+
+// Primary land-cover fetch: ESA WorldCover first (real 11 classes), io-lulc as a
+// safety net whenever WorldCover is wholly unavailable for a batch.
+async function fetchLandcover(points) {
+    const wc = await fetchEsaWorldCover(points);
+    if (wc !== null) return wc;
+    return fetchEsriLulc(points);
+}
+
 app.post("/landcover", async (req, res) => {
     const points = (req.body && req.body.points) || [];
     if (!Array.isArray(points) || points.length === 0) return res.json({ classes: [] });
@@ -934,7 +1035,7 @@ app.post("/landcover", async (req, res) => {
         for (let b = 0; b < need.length; b += LULC_BATCH) {
             const idxs = need.slice(b, b + LULC_BATCH);
             const pts  = idxs.map(i => ({ lat: classes[i]._lat, lon: classes[i]._lon }));
-            batches.push({ idxs, promise: fetchEsriLulc(pts) });
+            batches.push({ idxs, promise: fetchLandcover(pts) });
         }
         const results = await Promise.all(batches.map(b => b.promise));
         for (let bi = 0; bi < batches.length; bi++) {
