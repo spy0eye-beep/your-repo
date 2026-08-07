@@ -849,7 +849,16 @@ const LULC_BATCH       = 100;   // points per getSamples call; batches run in pa
 //   esa: 10 tree 20 shrub 30 grass 40 crop 50 built 60 bare 70 snow 80 water 90 wetland 95 mangrove 100 moss
 // Clouds (10) -> 0 so the engine falls through to köppen. Water (80) matches the
 // engine's own documented water convention (see ElevationService.getLandCover).
-const IO_TO_ESA = { 1: 80, 2: 10, 4: 90, 5: 40, 7: 50, 8: 60, 9: 70, 10: 0, 11: 30 };
+//
+// Rangeland (11) -> 20 "shrub" (NOT 30 "grass"). io-lulc has no shrub class, so
+// its single "Rangeland" bucket covers shrubland, steppe, savanna, tundra and
+// desert-scrub — the Grand Canyon, US Southwest, Sahara fringe, Mongolian steppe.
+// Mapping it to "grass" (30) made all of it render lush green (grass × cold-arid
+// köppen BSk resolves to "plains"). Routing it through "shrub" (20) instead lets
+// the engine's existing (ESA × Köppen) table resolve it by CLIMATE: arid → desert
+// /badlands/windswept_hills, temperate → plains. So rangeland reads as the dry
+// scrub it usually is, while genuine grassland climates still come out green.
+const IO_TO_ESA = { 1: 80, 2: 10, 4: 90, 5: 40, 7: 50, 8: 60, 9: 70, 10: 0, 11: 20 };
 
 // LULC is static per year — cache hard by ~11 m (4-decimal) lat/lon key.
 const landcoverCache     = new Map();
